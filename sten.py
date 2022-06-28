@@ -98,7 +98,7 @@ def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
 
 
-@implements(torch.nn.functional.linear)
+@implements(torch.nn.functional.linear, torch.mm)
 def sparse_operator_dispatch(base_impl, func, types, *args, **kwargs):
     op = sparsified_op(
         func,
@@ -383,16 +383,6 @@ class DenseTensor:
 # no-op sparsifier
 class KeepAll:
     pass
-
-
-class RandomFractionSparsifier:
-    def __init__(self, fraction):
-        self.fraction = fraction
-
-
-class ScalarFractionSparsifier:
-    def __init__(self, fraction):
-        self.fraction = fraction
 
 
 SPARSIFIER_IMPLEMENTATIONS = {}
@@ -742,6 +732,11 @@ def torch_nn_functional_linear_sign(input, weight, bias=None):
 @register_func_wrapper(torch.nn.functional.gelu)
 def torch_add_sign(input):
     return torch.nn.functional.gelu(input)
+
+
+@register_func_wrapper(torch.mm)
+def torch_nn_functional_linear_sign(input, mat2):
+    return torch.mm(input, mat2)
 
 
 # ====================== Operator signatures ======================

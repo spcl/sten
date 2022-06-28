@@ -205,8 +205,150 @@ def test_modify_bert_encoder():
 
 # ================ BERT Encoder ================
 
+# ++++++++++++++++ Custom implementations ++++++++++++++++
+
+
+class MyRandomFractionSparsifier:
+    def __init__(self, fraction):
+        self.fraction = fraction
+
+
+class MyCscTensor:
+    def __init__(self, data):
+        self.data = data
+
+    @staticmethod
+    def from_dense(tensor):
+        return MyCscTensor(scipy.sparse.csc_matrix(tensor))
+
+    def to_dense(self):
+        return torch.from_numpy(self.data.todense())
+
+    @property
+    def shape(self):
+        return torch.Size(self.data.shape)
+
+    def size(self):
+        return torch.Size(self.data.shape)
+
+
+@sten.register_fwd_op_impl(
+    operator=torch.add,
+    inp=(torch.Tensor, torch.Tensor, None, None),
+    out=tuple([(sten.KeepAll, torch.Tensor)]),
+)
+def sparse_add_fwd_impl(ctx, inputs, output_sparsifiers):
+    input, other, alpha, out = inputs
+    return torch.add(input, other, alpha=alpha, out=out)
+
+
+@sten.register_sparsifier_implementation(
+    sparsifer=MyRandomFractionSparsifier, inp=torch.Tensor, out=MyCscTensor
+)
+def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
+    return sten.SparseTensorWrapper(
+        MyCscTensor.from_dense(
+            sten.random_mask_sparsify(tensor, frac=sparsifier.fraction)
+        )
+    )
+
+
+@sten.register_fwd_op_impl(
+    operator=torch.mm,
+    inp=(MyCscTensor, torch.Tensor),
+    out=tuple([(sten.KeepAll, torch.Tensor)]),
+)
+def torch_mm_fwd_impl(ctx, inputs, output_sparsifiers):
+    input1, input2 = inputs
+    ctx.save_for_backward(input1, input2)
+    output = torch.from_numpy(input1.wrapped_tensor.data @ input2.numpy())
+    return output
+
+
+@sten.register_bwd_op_impl(
+    operator=torch.mm,
+    grad_out=(torch.Tensor,),
+    grad_inp=(
+        (sten.KeepAll, torch.Tensor),
+        (sten.KeepAll, torch.Tensor),
+    ),
+    inp=(MyCscTensor, torch.Tensor),
+)
+def torch_mm_bwd_impl(ctx, grad_outputs, input_sparsifiers):
+    input1, input2 = ctx.saved_tensors
+    [grad_output] = grad_outputs
+    grad_input1 = torch.mm(grad_output, input2.T)
+    grad_input2 = torch.from_numpy(input1.wrapped_tensor.data.transpose() @ grad_output)
+    return grad_input1, grad_input2
+
+
+@sten.register_bwd_op_impl(
+    operator=torch.add,
+    grad_out=(MyCscTensor,),
+    grad_inp=(
+        (sten.KeepAll, torch.Tensor),
+        (sten.KeepAll, torch.Tensor),
+        None,
+        None,
+    ),
+    inp=(torch.Tensor, torch.Tensor, None, None),
+)
+def torch_add_bwd_impl(ctx, grad_outputs, input_sparsifiers):
+    [grad_output] = grad_outputs
+    dense_output = grad_output.wrapped_tensor.to_dense()
+    return dense_output, dense_output, None, None
+
+
+def test_custom_implementations():
+    a = torch.randn(10, 20, requires_grad=True)
+    b = torch.randn(10, 20, requires_grad=True)
+    c = torch.randn(20, 30, requires_grad=True)
+    grad_d = torch.randn(10, 30)
+
+    d = torch.mm(torch.add(a, b), c)
+    d.backward(grad_d)
+
+    assert a.grad.shape == a.shape
+    assert b.grad.shape == b.shape
+    assert c.grad.shape == c.shape
+
+    sparse_add = sten.sparsified_op(
+        orig_op=torch.add,
+        out_fmt=tuple(
+            [
+                (
+                    sten.KeepAll(),
+                    torch.Tensor,
+                    MyRandomFractionSparsifier(0.5),
+                    MyCscTensor,
+                )
+            ]
+        ),
+        grad_out_fmt=tuple(
+            [
+                (
+                    sten.KeepAll(),
+                    torch.Tensor,
+                    MyRandomFractionSparsifier(0.5),
+                    MyCscTensor,
+                )
+            ]
+        ),
+    )
+
+    d = torch.mm(sparse_add(a, b), c)
+    d.backward(grad_d)
+
+    assert a.grad.shape == a.shape
+    assert b.grad.shape == b.shape
+    assert c.grad.shape == c.shape
+
+
+# ================ Custom implementations ================
+
 
 if __name__ == "__main__":
     test_simple_graph()
     test_build_mlp_from_scratch()
     test_modify_bert_encoder()
+    test_custom_implementations()
