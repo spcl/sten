@@ -15,4 +15,5 @@ The core implementation is located in [sten.py](sten.py). It is tested by runnin
 
 * Check [build_from_scratch.ipynb](build_from_scratch.ipynb) to see the example use of interface to build PyTorch module from scratch.
 * Check [modify_existing.ipynb](modify_existing.ipynb) to see the example of converting existing dense PyTorch module to sparse.
+* Check [custom_implementations.ipynb](custom_implementations.ipynb) to see the example of registering custom implementations for sparsifiers and operators that match specific formats of input and output tensors.
 

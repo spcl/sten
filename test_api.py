@@ -311,6 +311,10 @@ def test_custom_implementations():
     assert a.grad.shape == a.shape
     assert b.grad.shape == b.shape
     assert c.grad.shape == c.shape
+    
+    grad_a = a.grad
+    grad_b = b.grad
+    grad_c = c.grad
 
     sparse_add = sten.sparsified_op(
         orig_op=torch.add,
@@ -319,7 +323,7 @@ def test_custom_implementations():
                 (
                     sten.KeepAll(),
                     torch.Tensor,
-                    MyRandomFractionSparsifier(0.5),
+                    MyRandomFractionSparsifier(0),
                     MyCscTensor,
                 )
             ]
@@ -329,19 +333,27 @@ def test_custom_implementations():
                 (
                     sten.KeepAll(),
                     torch.Tensor,
-                    MyRandomFractionSparsifier(0.5),
+                    MyRandomFractionSparsifier(0),
                     MyCscTensor,
                 )
             ]
         ),
     )
 
-    d = torch.mm(sparse_add(a, b), c)
-    d.backward(grad_d)
+    del a.grad
+    del b.grad
+    del c.grad
+
+    d2 = torch.mm(sparse_add(a, b), c)
+    d2.backward(grad_d)
 
     assert a.grad.shape == a.shape
     assert b.grad.shape == b.shape
     assert c.grad.shape == c.shape
+    
+    assert torch.allclose(grad_a, a.grad, rtol=1e-2, atol=1e-4)
+    assert torch.allclose(grad_b, b.grad, rtol=1e-2, atol=1e-4)
+    assert torch.allclose(grad_c, c.grad, rtol=1e-2, atol=1e-4)
 
 
 # ================ Custom implementations ================
