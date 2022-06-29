@@ -679,7 +679,7 @@ def scalar_mask_sparsify(tensor, frac):
 @register_sparsifier_implementation(
     sparsifer=RandomFractionSparsifier, inp=CooTensor, out=CsrTensor
 )
-def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
+def random_fraction_sparsifier_coo_csr(sparsifier, tensor):
     return SparseTensorWrapper(
         CsrTensor.from_dense(
             random_mask_sparsify(tensor.wrapped_tensor.to_dense(), sparsifier.fraction)
@@ -690,7 +690,7 @@ def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
 @register_sparsifier_implementation(
     sparsifer=RandomFractionSparsifier, inp=torch.Tensor, out=CscTensor
 )
-def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
+def random_fraction_sparsifier_dense_csc(sparsifier, tensor):
     return SparseTensorWrapper(
         CscTensor.from_dense(random_mask_sparsify(tensor, frac=sparsifier.fraction))
     )
@@ -699,7 +699,7 @@ def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
 @register_sparsifier_implementation(
     sparsifer=RandomFractionSparsifier, inp=torch.Tensor, out=CsrTensor
 )
-def scalar_fraction_sparsifier_torch_csr(sparsifier, tensor):
+def random_fraction_sparsifier_dense_csr(sparsifier, tensor):
     return SparseTensorWrapper(
         CsrTensor.from_dense(random_mask_sparsify(tensor, frac=sparsifier.fraction))
     )
@@ -708,7 +708,7 @@ def scalar_fraction_sparsifier_torch_csr(sparsifier, tensor):
 @register_sparsifier_implementation(
     sparsifer=ScalarFractionSparsifier, inp=torch.Tensor, out=CsrTensor
 )
-def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
+def scalar_fraction_sparsifier_dense_csr(sparsifier, tensor):
     return SparseTensorWrapper(
         CsrTensor.from_dense(scalar_mask_sparsify(tensor, sparsifier.fraction))
     )
