@@ -299,7 +299,31 @@ def torch_add_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     return dense_output, dense_output, None, None
 
 
-def test_custom_implementations():
+class MyRandomFractionSparsifierFallback:
+    def __init__(self, fraction):
+        self.fraction = fraction
+
+
+class MyCscTensorFallback:
+    def __init__(self, data):
+        self.data = data
+
+    @staticmethod
+    def from_dense(tensor):
+        return MyCscTensor(scipy.sparse.csc_matrix(tensor))
+
+    def to_dense(self):
+        return torch.from_numpy(self.data.todense())
+
+    @property
+    def shape(self):
+        return torch.Size(self.data.shape)
+
+    def size(self):
+        return torch.Size(self.data.shape)
+
+
+def add_mm_implementations(sparsifier_cls, tensor_cls):
     a = torch.randn(10, 20, requires_grad=True)
     b = torch.randn(10, 20, requires_grad=True)
     c = torch.randn(20, 30, requires_grad=True)
@@ -311,7 +335,7 @@ def test_custom_implementations():
     assert a.grad.shape == a.shape
     assert b.grad.shape == b.shape
     assert c.grad.shape == c.shape
-    
+
     grad_a = a.grad
     grad_b = b.grad
     grad_c = c.grad
@@ -323,8 +347,8 @@ def test_custom_implementations():
                 (
                     sten.KeepAll(),
                     torch.Tensor,
-                    MyRandomFractionSparsifier(0),
-                    MyCscTensor,
+                    sparsifier_cls(0),
+                    tensor_cls,
                 )
             ]
         ),
@@ -333,27 +357,37 @@ def test_custom_implementations():
                 (
                     sten.KeepAll(),
                     torch.Tensor,
-                    MyRandomFractionSparsifier(0),
-                    MyCscTensor,
+                    sparsifier_cls(0),
+                    tensor_cls,
                 )
             ]
         ),
     )
 
-    del a.grad
-    del b.grad
-    del c.grad
+    a.grad = None
+    b.grad = None
+    c.grad = None
 
     d2 = torch.mm(sparse_add(a, b), c)
     d2.backward(grad_d)
 
+    assert torch.allclose(d, d2, rtol=1e-2, atol=1e-4)
+
     assert a.grad.shape == a.shape
     assert b.grad.shape == b.shape
     assert c.grad.shape == c.shape
-    
+
     assert torch.allclose(grad_a, a.grad, rtol=1e-2, atol=1e-4)
     assert torch.allclose(grad_b, b.grad, rtol=1e-2, atol=1e-4)
     assert torch.allclose(grad_c, c.grad, rtol=1e-2, atol=1e-4)
+
+
+def test_custom_implementations():
+    add_mm_implementations(MyRandomFractionSparsifier, MyCscTensor)
+
+
+def test_fallback_implementations():
+    add_mm_implementations(MyRandomFractionSparsifierFallback, MyCscTensorFallback)
 
 
 # ================ Custom implementations ================
@@ -364,3 +398,4 @@ if __name__ == "__main__":
     test_build_mlp_from_scratch()
     test_modify_bert_encoder()
     test_custom_implementations()
+    test_fallback_implementations()
