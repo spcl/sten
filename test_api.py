@@ -2,6 +2,9 @@ import torch
 import sten
 import numpy as np
 import scipy, scipy.sparse
+import nbformat
+from nbconvert.preprocessors import ExecutePreprocessor
+import pytest
 
 
 def test_simple_graph():
@@ -393,9 +396,26 @@ def test_fallback_implementations():
 # ================ Custom implementations ================
 
 
+notebooks_list = [
+    "build_from_scratch.ipynb",
+    "custom_implementations.ipynb",
+    "modify_existing.ipynb",
+]
+
+
+@pytest.mark.parametrize("notebook", notebooks_list)
+def test_jupyter_notebooks(notebook):
+    with open(notebook) as f:
+        nb = nbformat.read(f, as_version=4)
+        ep = ExecutePreprocessor()
+        ep.preprocess(nb)
+
+
 if __name__ == "__main__":
     test_simple_graph()
     test_build_mlp_from_scratch()
     test_modify_bert_encoder()
     test_custom_implementations()
     test_fallback_implementations()
+    for n in notebooks_list:
+        test_jupyter_notebooks(n)
