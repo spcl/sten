@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sten"
+version = "0.0.1"
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "numpy",
+    "scipy",
+    "pytest",
+    "notebook",
+    "transformers",
+    "tqdm",
+    "boto3",
+    "requests",
+    "regex",
+    "sentencepiece",
+    "sacremoses",
+    "importlib-metadata",
+    "tabulate",
+    "black",
+]

@@ -2,7 +2,6 @@ import torch
 import copy
 import numpy as np
 import torch.fx
-import functools
 import inspect
 import scipy, scipy.sparse
 import logging
