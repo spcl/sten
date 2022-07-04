@@ -125,8 +125,8 @@ def sparse_default_impl(base_impl, func, types, *args, **kwargs):
 def sparse_operator_dispatch(base_impl, func, types, *args, **kwargs):
     op = sparsified_op(
         func,
-        tuple([(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)]),
-        tuple([(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)]),
+        [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)],
+        [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)],
     )
     return op(*args, **kwargs)
 
@@ -147,7 +147,7 @@ def sparse_copying_impl(base_impl, func, types, *args, **kwargs):
 
 @implements(torch.Tensor.shape.__get__)
 def sparse_redirection_property_impl(base_impl, func, types, *args, **kwargs):
-    (original_tensor,) = args
+    [original_tensor] = args
     return getattr(original_tensor.wrapped_tensor, func.__self__.__name__)
 
 
@@ -401,8 +401,8 @@ class SparsityBuilder:
                 [node] = (n for n in submodule.graph.nodes if n.name == direct_name)
                 node.target = sparsified_op(
                     node.target,
-                    tuple([(sp1, fmt1, sp2, fmt2)]),
-                    tuple([(grad_sp1, grad_fmt1, grad_sp2, grad_fmt2)]),
+                    [(sp1, fmt1, sp2, fmt2)],
+                    [(grad_sp1, grad_fmt1, grad_sp2, grad_fmt2)],
                 )
 
             sparse_module = self.replace_with_traced_submodules(sparse_module)
@@ -706,6 +706,9 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 
 
 def sparsified_op(orig_op, out_fmt, grad_out_fmt):
+    out_fmt = tuple(out_fmt)
+    grad_out_fmt = tuple(grad_out_fmt)
+    
     out_fmt = expand_none_tuples(out_fmt, 4)
 
     def sparse_op(*args, **kwargs):
@@ -889,13 +892,13 @@ def torch_nn_functional_linear_sign(input, mat2):
 @register_fwd_op_impl(
     operator=torch.add,
     inp=(DenseTensor, CsrTensor, None, None),
-    out=((RandomFractionSparsifier, CsrTensor),),
+    out=[(RandomFractionSparsifier, CsrTensor)],
 )
 def sparse_torch_add_fwd_impl(ctx, inputs, output_sparsifiers):
     input, other, alpha, out = inputs
     if out is not None:
         raise ValueError("In-place implementation is not supported")
-    (out_sp,) = output_sparsifiers
+    [out_sp] = output_sparsifiers
     dense_out = torch.add(
         input.wrapped_tensor.to_dense(),
         other.wrapped_tensor.to_dense(),
@@ -909,7 +912,7 @@ def sparse_torch_add_fwd_impl(ctx, inputs, output_sparsifiers):
 @register_fwd_op_impl(
     operator=torch.nn.functional.linear,
     inp=(torch.Tensor, CscTensor, torch.Tensor),
-    out=((KeepAll, torch.Tensor),),
+    out=[(KeepAll, torch.Tensor)],
 )
 def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
     input, weight, bias = inputs
@@ -922,7 +925,7 @@ def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
 @register_fwd_op_impl(
     operator=torch.nn.functional.linear,
     inp=(torch.Tensor, CsrTensor, torch.Tensor),
-    out=((KeepAll, torch.Tensor),),
+    out=[(KeepAll, torch.Tensor)],
 )
 def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
     input, weight, bias = inputs
@@ -938,7 +941,7 @@ def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
 @register_fwd_op_impl(
     operator=torch.nn.functional.linear,
     inp=(CooTensor, CsrTensor, torch.Tensor),
-    out=((KeepAll, torch.Tensor),),
+    out=[(KeepAll, torch.Tensor)],
 )
 def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
     input, weight, bias = inputs
@@ -954,8 +957,8 @@ def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
 
 @register_fwd_op_impl(
     operator=torch.nn.functional.gelu,
-    inp=tuple([torch.Tensor]),
-    out=tuple([(RandomFractionSparsifier, CooTensor)]),
+    inp=[torch.Tensor],
+    out=[(RandomFractionSparsifier, CooTensor)],
 )
 def sparse_torch_nn_functional_gelu_fwd_impl(ctx, inputs, output_sparsifiers):
     [input] = inputs
@@ -973,7 +976,7 @@ def sparse_torch_nn_functional_gelu_fwd_impl(ctx, inputs, output_sparsifiers):
 # ++++++++++++++++++++++ Backward operator implementations ++++++++++++++++++++++
 @register_bwd_op_impl(
     operator=torch.add,
-    grad_out=(DenseTensor,),
+    grad_out=[DenseTensor],
     grad_inp=(
         (RandomFractionSparsifier, CooTensor),
         (KeepAll, DenseTensor),
@@ -983,7 +986,7 @@ def sparse_torch_nn_functional_gelu_fwd_impl(ctx, inputs, output_sparsifiers):
     inp=(DenseTensor, CsrTensor, None, None),
 )
 def sparse_torch_add_bwd_impl(ctx, output_grads, input_grad_sparsifiers):
-    (out_grad,) = output_grads
+    [out_grad] = output_grads
     out_grad = out_grad.wrapped_tensor.to_dense()
     sp0 = input_grad_sparsifiers[0]
     mask0 = np.random.choice(
@@ -1001,7 +1004,7 @@ def sparse_torch_add_bwd_impl(ctx, output_grads, input_grad_sparsifiers):
 
 @register_bwd_op_impl(
     operator=torch.nn.functional.linear,
-    grad_out=(torch.Tensor,),
+    grad_out=[torch.Tensor],
     grad_inp=(
         (KeepAll, torch.Tensor),
         (KeepAll, torch.Tensor),
@@ -1011,7 +1014,7 @@ def sparse_torch_add_bwd_impl(ctx, output_grads, input_grad_sparsifiers):
 )
 def sparse_torch_nn_functional_linear_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     input, weight = ctx.saved_tensors
-    (grad_out,) = grad_outputs
+    [grad_out] = grad_outputs
     grad_bias = grad_out.sum(0)
     grad_input = torch.from_numpy(grad_out.numpy() @ weight.wrapped_tensor.data)
     grad_weight = grad_out.T @ input
@@ -1020,7 +1023,7 @@ def sparse_torch_nn_functional_linear_bwd_impl(ctx, grad_outputs, input_sparsifi
 
 @register_bwd_op_impl(
     operator=torch.nn.functional.linear,
-    grad_out=tuple([torch.Tensor]),
+    grad_out=[torch.Tensor],
     grad_inp=(
         (KeepAll, torch.Tensor),
         (KeepAll, torch.Tensor),
@@ -1044,9 +1047,9 @@ def sparse_torch_nn_functional_linear_bwd_impl(ctx, grad_outputs, input_sparsifi
 
 @register_bwd_op_impl(
     operator=torch.nn.functional.gelu,
-    grad_out=tuple([DenseTensor]),
-    grad_inp=tuple([(KeepAll, torch.Tensor)]),
-    inp=tuple([torch.Tensor]),
+    grad_out=[DenseTensor],
+    grad_inp=[(KeepAll, torch.Tensor)],
+    inp=[torch.Tensor],
 )
 def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     [input] = ctx.saved_tensors
@@ -1061,7 +1064,7 @@ def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifier
 
 @register_bwd_op_impl(
     operator=torch.nn.functional.linear,
-    grad_out=(torch.Tensor,),
+    grad_out=[torch.Tensor],
     grad_inp=(
         (KeepAll, torch.Tensor),
         (KeepAll, torch.Tensor),
@@ -1071,7 +1074,7 @@ def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifier
 )
 def sparse_torch_nn_functional_linear_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     input, weight = ctx.saved_tensors
-    (grad_out,) = grad_outputs
+    [grad_out] = grad_outputs
     grad_bias = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
     grad_out1 = grad_out.view(-1, grad_out.shape[-1])
     grad_input = torch.t(
