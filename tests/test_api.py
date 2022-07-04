@@ -46,6 +46,19 @@ def test_simple_graph():
     assert isinstance(y.grad.wrapped_tensor, sten.DenseTensor)
 
 
+def test_modify_transformer_encoder_layer():
+    model = torch.nn.TransformerEncoderLayer(d_model=512, nhead=8)
+    sb = sten.SparsityBuilder(model)
+    # sb.set_weight(name='linear1.weight', initial_sparsifier=sten.ScalarFractionSparsifier, out_format=sten.CooTensor)
+    sb.set_interm(
+        name="relu",
+        external_sparsifier=sten.ScalarFractionSparsifier,
+        out_format=sten.CooTensor,
+    )
+    sparse_model = sb.get_sparse_model()
+    sparse_model(torch.randn(8, 128, 512))
+
+
 # ++++++++++++++++ MLP ++++++++++++++++
 
 
@@ -395,6 +408,7 @@ def test_fallback_implementations():
 
 if __name__ == "__main__":
     test_simple_graph()
+    test_modify_transformer_encoder_layer()
     test_build_mlp_from_scratch()
     test_modify_bert_encoder()
     test_custom_implementations()

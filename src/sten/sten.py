@@ -193,10 +193,29 @@ def densify_params(args, kwargs):
 @implements(torch.allclose, torch.Tensor.__repr__)
 def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
     dense_args, dense_kwargs = densify_params(args, kwargs)
-    return base_impl(func, types, dense_args, dense_kwargs)
+    output = func(*dense_args, **dense_kwargs)
+    return output
 
 
 ##################
+
+
+# wrapper for dense tensors: used to enable sparse gradients without sparsifying original tensor
+class DenseTensor:
+    def __init__(self, data):
+        self.data = data
+
+    @staticmethod
+    def from_dense(tensor):
+        return DenseTensor(tensor)
+
+    def to_dense(self):
+        return self.data
+
+
+# no-op sparsifier
+class KeepAll:
+    pass
 
 
 def find_direct_container(module, weight_path):
@@ -237,11 +256,11 @@ class SparsityBuilder:
     def set_weight(
         self,
         name,
-        initial_sparsifier,
-        inline_sparsifier,
-        tmp_format,
-        external_sparsifier,
-        out_format,
+        initial_sparsifier=KeepAll,
+        inline_sparsifier=KeepAll,
+        tmp_format=torch.Tensor,
+        external_sparsifier=KeepAll,
+        out_format=DenseTensor,
     ):
         self.weights[name] = (
             inline_sparsifier,
@@ -252,7 +271,12 @@ class SparsityBuilder:
         self.initial_weight_sparsifiers[name] = initial_sparsifier
 
     def set_weight_grad(
-        self, name, inline_sparsifier, tmp_format, external_sparsifier, out_format
+        self,
+        name,
+        inline_sparsifier=KeepAll,
+        tmp_format=torch.Tensor,
+        external_sparsifier=KeepAll,
+        out_format=DenseTensor,
     ):
         self.grad_weights[name] = (
             inline_sparsifier,
@@ -262,7 +286,12 @@ class SparsityBuilder:
         )
 
     def set_interm(
-        self, name, inline_sparsifier, tmp_format, external_sparsifier, out_format
+        self,
+        name,
+        inline_sparsifier=KeepAll,
+        tmp_format=torch.Tensor,
+        external_sparsifier=KeepAll,
+        out_format=DenseTensor,
     ):
         self.interms[name] = (
             inline_sparsifier,
@@ -272,7 +301,12 @@ class SparsityBuilder:
         )
 
     def set_interm_grad(
-        self, name, inline_sparsifier, tmp_format, external_sparsifier, out_format
+        self,
+        name,
+        inline_sparsifier=KeepAll,
+        tmp_format=torch.Tensor,
+        external_sparsifier=KeepAll,
+        out_format=DenseTensor,
     ):
         self.grad_interms[name] = (
             inline_sparsifier,
@@ -325,12 +359,13 @@ class SparsityBuilder:
         for module_path, traced_module in traced_submodules_list:
             if module_path == "":
                 sparse_module = traced_module
-            module_parent, module_name = find_direct_container(
-                sparse_module, module_path
-            )
-            if not hasattr(module_parent, module_name):
-                raise KeyError(f"Can't find module under {module_parent} path")
-            setattr(module_parent, module_name, traced_module)
+            else:
+                module_parent, module_name = find_direct_container(
+                    sparse_module, module_path
+                )
+                if not hasattr(module_parent, module_name):
+                    raise KeyError(f"Can't find module under {module_path} path")
+                setattr(module_parent, module_name, traced_module)
 
         return sparse_module
 
@@ -394,24 +429,6 @@ def has_format(tensor, format):
     if tensor.wrapped_tensor.__class__ == format:
         return True
     return False
-
-
-# wrapper for dense tensors: used to enable sparse gradients without sparsifying original tensor
-class DenseTensor:
-    def __init__(self, data):
-        self.data = data
-
-    @staticmethod
-    def from_dense(tensor):
-        return DenseTensor(tensor)
-
-    def to_dense(self):
-        return self.data
-
-
-# no-op sparsifier
-class KeepAll:
-    pass
 
 
 SPARSIFIER_IMPLEMENTATIONS = {}
@@ -515,20 +532,18 @@ def get_func_wrapper(original_func):
         raise KeyError(
             f"Function wrapper for function {original_func} is not registered and signature can't be guessed automaticaly."
         )
-    raise Exception("TODO")
 
-    def f(*args):
-        return original_func.bind(args)
-
-    return f
+    return original_func
 
 
 def simplify_tensor_tuple(tensors):
-    return tensors[0] if len(tensors) == 1 else tuple(tensors)
+    singular_sequence = isinstance(tensors, (tuple, list)) and len(tensors) == 1
+    return tensors[0] if singular_sequence else tuple(tensors)
 
 
 def canonicalize_tensor_tuple(tensors):
-    return tensors if isinstance(tensors, tuple) else (tensors,)
+    singular_sequence = isinstance(tensors, (tuple, list))
+    return tensors if singular_sequence else (tensors,)
 
 
 def check_formats(op_instance, tensors, target_formats):
@@ -621,7 +636,17 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         def find_gradient_fmt(tensor):
             if isinstance(tensor, SparseTensorWrapper):
                 if not hasattr(tensor, "grad_fmt"):
-                    raise ValueError("Format of gradient tensor is not set")
+                    err_msg = "Format of gradient tensor is not set."
+                    if DISPATCH_FAILURE == DISPATCH_WARN:
+                        logging.warning(f"{err_msg} Fallback to dense implementation.")
+                        tensor.grad_fmt = (
+                            KeepAll(),
+                            torch.Tensor,
+                            KeepAll(),
+                            DenseTensor,
+                        )
+                    else:
+                        raise DispatchError(err_msg)
                 return tensor.grad_fmt
             if isinstance(tensor, torch.Tensor):
                 return (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
@@ -648,7 +673,8 @@ class SparseOperatorDispatcher(torch.autograd.Function):
             get_sparsifier_implementation(s2.__class__, f1, f2)(s2, tmp_out)
             for tmp_out, f1, s2, f2 in zip(tmp_outputs, fmt1, sp2, fmt2)
         )
-        return simplify_tensor_tuple(outputs)
+        outptus = simplify_tensor_tuple(outputs)
+        return outptus
 
     @staticmethod
     def backward(ctx, *args):
