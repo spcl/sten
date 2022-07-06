@@ -256,10 +256,10 @@ class SparsityBuilder:
     def set_weight(
         self,
         name,
-        initial_sparsifier=KeepAll,
-        inline_sparsifier=KeepAll,
+        initial_sparsifier=KeepAll(),
+        inline_sparsifier=KeepAll(),
         tmp_format=torch.Tensor,
-        external_sparsifier=KeepAll,
+        external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
         self.weights[name] = (
@@ -273,9 +273,9 @@ class SparsityBuilder:
     def set_weight_grad(
         self,
         name,
-        inline_sparsifier=KeepAll,
+        inline_sparsifier=KeepAll(),
         tmp_format=torch.Tensor,
-        external_sparsifier=KeepAll,
+        external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
         self.grad_weights[name] = (
@@ -288,9 +288,9 @@ class SparsityBuilder:
     def set_interm(
         self,
         name,
-        inline_sparsifier=KeepAll,
+        inline_sparsifier=KeepAll(),
         tmp_format=torch.Tensor,
-        external_sparsifier=KeepAll,
+        external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
         self.interms[name] = (
@@ -303,9 +303,9 @@ class SparsityBuilder:
     def set_interm_grad(
         self,
         name,
-        inline_sparsifier=KeepAll,
+        inline_sparsifier=KeepAll(),
         tmp_format=torch.Tensor,
-        external_sparsifier=KeepAll,
+        external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
         self.grad_interms[name] = (
