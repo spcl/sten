@@ -116,9 +116,20 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     torch.Tensor.grad_fn.__get__,
     torch.Tensor.dtype.__get__,
     torch.Tensor.backward,
+    torch.Tensor.is_floating_point,
+    torch.Tensor.device.__get__,
+    torch.Tensor.is_sparse.__get__, # Pretend to be dense to prevent complaints from PyTorch
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
+
+
+@implements(torch.Tensor.to)
+def sparse_torch_tensor_to(base_impl, func, types, *args, **kwargs):
+    if args[1] != torch.device("cpu"):
+        raise Exception("STen: Only CPU device is supported")
+    res = base_impl(func, types, args, kwargs)
+    return res
 
 
 @implements(torch.nn.functional.linear, torch.mm)
@@ -145,22 +156,39 @@ def sparse_copying_impl(base_impl, func, types, *args, **kwargs):
     return copied_tensor
 
 
-@implements(torch.Tensor.shape.__get__)
+@implements(
+    torch.Tensor.shape.__get__,
+    torch.Tensor.data.__get__,
+)
 def sparse_redirection_property_impl(base_impl, func, types, *args, **kwargs):
     [original_tensor] = args
-    return getattr(original_tensor.wrapped_tensor, func.__self__.__name__)
+    result = getattr(original_tensor.wrapped_tensor, func.__self__.__name__)
+    if isinstance(result, type(original_tensor.wrapped_tensor)):
+        return SparseTensorWrapper(result)
+    return result
 
 
-@implements(torch.Tensor.size)
+@implements(
+    torch.Tensor.size,
+    torch.Tensor.numel,
+    torch.norm,
+    torch.Tensor.zero_,
+    torch.Tensor.__reduce_ex__,
+    torch.Tensor.clone,
+)
 def sparse_redirection_function_impl(base_impl, func, types, *args, **kwargs):
     original_tensor = args[0]
-    return getattr(original_tensor.wrapped_tensor, func.__name__)(*(args[1:]), **kwargs)
+    result = getattr(original_tensor.wrapped_tensor, func.__name__)(*(args[1:]), **kwargs)
+    if isinstance(result, type(original_tensor.wrapped_tensor)):
+        return SparseTensorWrapper(result)
+    return result
 
 
 @implements(torch.Tensor.requires_grad_, torch.Tensor.requires_grad.__set__)
 def torch_tensor_requires_grad_(base_impl, func, types, self, requries_grad=True):
-    base_impl(func, types, (self, requries_grad))
+    res = base_impl(func, types, (self, requries_grad))
     self.update_grad_fix_hook()
+    return res
 
 
 @implements(torch.Tensor.copy_)
@@ -175,6 +203,61 @@ def torch_tensor_copy_(base_impl, func, types, self, src, non_blocking=False):
         )
         dst = converter(KeepAll(), src)
         self.wrapped_tensor = dst.wrapped_tensor
+        
+        
+@implements(torch.Tensor.add_)
+def torch_tensor_add_(base_impl, func, types, self, other, *, alpha=1):
+    if get_format(self) == torch.Tensor:  # sparse to dense
+        self.add_(other.wrapped_tensor.to_dense(), alpha=alpha)
+    elif get_format(other) == torch.Tensor:  # dense to sparse
+        self.wrapped_tensor.add_(other, alpha=alpha)
+    else:  # sparse to sparse
+        self.wrapped_tensor.add_(other.wrapped_tensor.to_dense(), alpha=alpha)
+        
+        
+@implements(torch.Tensor.mul_)
+def torch_tensor_mul_(base_impl, func, types, self, other):
+    if get_format(self) == torch.Tensor:  # sparse to dense
+        self.mul_(other.wrapped_tensor.to_dense())
+    elif get_format(other) == torch.Tensor:  # dense to sparse
+        self.wrapped_tensor.mul_(other)
+    else:  # sparse to sparse
+        raise Exception("Not implemented")
+        
+
+@implements(torch.Tensor.addcmul_)
+def torch_tensor_mul_(base_impl, func, types, self, tensor1, tensor2, *, value=1):
+    if get_format(self) == torch.Tensor:  # any to dense
+        d1, d2 = tensor1, tensor2
+        if hasattr(d1, 'wrapped_tensor'):
+            d1 = d1.wrapped_tensor.to_dense()
+        if hasattr(d2, 'wrapped_tensor'):
+            d2 = d2.wrapped_tensor.to_dense()
+        self.addcmul_(d1, d2, value=value)
+    elif get_format(tensor1) == torch.Tensor and get_format(tensor2) == torch.Tensor:  # dense to sparse
+        self.wrapped_tensor.addcmul_(tensor1, tensor2, value=value)
+    else:  # sparse to sparse
+        raise Exception("Not implemented")    
+
+
+@implements(torch.Tensor.addcdiv_)
+def torch_tensor_mul_(base_impl, func, types, self, tensor1, tensor2, *, value=1):
+    if get_format(self) == torch.Tensor:  # any to dense
+        d1, d2 = tensor1, tensor2
+        if hasattr(d1, 'wrapped_tensor'):
+            d1 = d1.wrapped_tensor.to_dense()
+        if hasattr(d2, 'wrapped_tensor'):
+            d2 = d2.wrapped_tensor.to_dense()
+        self.addcdiv_(d1, d2, value=value)
+    elif get_format(tensor1) == torch.Tensor and get_format(tensor2) == torch.Tensor:  # dense to sparse
+        self.wrapped_tensor.addcdiv_(tensor1, tensor2, value=value)
+    else:  # sparse to sparse
+        raise Exception("Not implemented")    
+
+
+@implements(torch._has_compatible_shallow_copy_type)
+def torch__has_compatible_shallow_copy_type(base_impl, func, types, *args, **kwargs):
+    return False
 
 
 def densify_params(args, kwargs):
@@ -190,7 +273,7 @@ def densify_params(args, kwargs):
     return dense_args, dense_kwargs
 
 
-@implements(torch.allclose, torch.Tensor.__repr__)
+@implements(torch.allclose, torch.Tensor.__repr__, torch.zeros_like)
 def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
     dense_args, dense_kwargs = densify_params(args, kwargs)
     output = func(*dense_args, **dense_kwargs)
@@ -487,7 +570,15 @@ def register_fwd_op_impl(operator, inp, out):
 def get_fwd_op_impl(operator, inp, out):
     impl = FWD_OP_IMPLS.get((operator, tuple(inp), tuple(out)))
     if impl is None:
-        err_msg = f"Sparse operator implementation is not registered (fwd). op: {operator} inp: {inp} out: {out}."
+        inp_str = [f"{t.__module__}.{t.__qualname__}" for t in inp]
+        out_str = [
+            (
+                f"{s.__module__}.{s.__qualname__}",
+                f"{t.__module__}.{t.__qualname__}",
+            )
+            for s, t in out
+        ]
+        err_msg = f"Sparse operator implementation is not registered (fwd). op: {operator.__module__}.{operator.__qualname__} inp: {inp_str} out: {out_str}."
         raise DispatchError(err_msg)
     return impl
 
@@ -506,7 +597,16 @@ def register_bwd_op_impl(operator, grad_out, grad_inp, inp):
 def get_bwd_op_impl(operator, grad_out, grad_inp, inp):
     impl = BWD_OP_IMPLS.get((operator, tuple(grad_out), tuple(grad_inp), tuple(inp)))
     if impl is None:
-        err_msg = f"Sparse operator implementation is not registered (bwd). op: {operator} grad_out: {grad_out} grad_inp: {grad_inp} inp: {inp}."
+        grad_out_str = [f"{t.__module__}.{t.__qualname__}" for t in grad_out]
+        grad_inp_str = [
+            (
+                f"{s.__module__}.{s.__qualname__}",
+                f"{t.__module__}.{t.__qualname__}",
+            )
+            for s, t in grad_inp
+        ]
+        inp_str = [f"{t.__module__}.{t.__qualname__}" for t in inp]
+        err_msg = f"Sparse operator implementation is not registered (bwd). op: {operator.__module__}.{operator.__qualname__} grad_out: {grad_out_str} grad_inp: {grad_inp_str} inp: {inp_str}."
         raise DispatchError(err_msg)
     return impl
 
@@ -708,7 +808,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 def sparsified_op(orig_op, out_fmt, grad_out_fmt):
     out_fmt = tuple(out_fmt)
     grad_out_fmt = tuple(grad_out_fmt)
-    
+
     out_fmt = expand_none_tuples(out_fmt, 4)
 
     def sparse_op(*args, **kwargs):
