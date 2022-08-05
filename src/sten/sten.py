@@ -251,7 +251,7 @@ def torch_tensor_copy_(base_impl, func, types, self, src, non_blocking=False):
     if get_format(self) == torch.Tensor:  # sparse to dense
         self.copy_(src.wrapped_tensor.to_dense())
     elif get_format(src) == torch.Tensor:  # dense to sparse
-        self.wrapped_tensor = self.wrapped_tensor.clone_layout(src)
+        self.wrapped_tensor = self.wrapped_tensor.clone_format(src)
     else:  # sparse to sparse
         converter = get_sparsifier_implementation(
             KeepAll, get_format(src), get_format(self)
@@ -626,18 +626,20 @@ def register_fwd_op_impl(operator, inp, out):
     return decorator
 
 
+def pretty_name(obj):
+    if isinstance(obj, (list, tuple)):
+        return type(obj)([pretty_name(o) for o in obj])
+    if hasattr(obj, '__module__') and hasattr(obj, '__qualname__'):
+        return f"{obj.__module__}.{obj.__qualname__}"
+    return str(obj)
+
+
 def get_fwd_op_impl(operator, inp, out):
     impl = FWD_OP_IMPLS.get((operator, tuple(inp), tuple(out)))
     if impl is None:
-        inp_str = [f"{t.__module__}.{t.__qualname__}" for t in inp]
-        out_str = [
-            (
-                f"{s.__module__}.{s.__qualname__}",
-                f"{t.__module__}.{t.__qualname__}",
-            )
-            for s, t in out
-        ]
-        err_msg = f"Sparse operator implementation is not registered (fwd). op: {operator.__module__}.{operator.__qualname__} inp: {inp_str} out: {out_str}."
+        inp_str = pretty_name(inp)
+        out_str = pretty_name(out)
+        err_msg = f"Sparse operator implementation is not registered (fwd). op: {pretty_name(operator)} inp: {inp_str} out: {out_str}."
         raise DispatchError(err_msg)
     return impl
 
@@ -656,16 +658,10 @@ def register_bwd_op_impl(operator, grad_out, grad_inp, inp):
 def get_bwd_op_impl(operator, grad_out, grad_inp, inp):
     impl = BWD_OP_IMPLS.get((operator, tuple(grad_out), tuple(grad_inp), tuple(inp)))
     if impl is None:
-        grad_out_str = [f"{t.__module__}.{t.__qualname__}" for t in grad_out]
-        grad_inp_str = [
-            (
-                f"{s.__module__}.{s.__qualname__}",
-                f"{t.__module__}.{t.__qualname__}",
-            )
-            for s, t in grad_inp
-        ]
-        inp_str = [f"{t.__module__}.{t.__qualname__}" for t in inp]
-        err_msg = f"Sparse operator implementation is not registered (bwd). op: {operator.__module__}.{operator.__qualname__} grad_out: {grad_out_str} grad_inp: {grad_inp_str} inp: {inp_str}."
+        grad_out_str = pretty_name(grad_out)
+        grad_inp_str = pretty_name(grad_inp)
+        inp_str = pretty_name(inp)
+        err_msg = f"Sparse operator implementation is not registered (bwd). op: {pretty_name(operator)} grad_out: {grad_out_str} grad_inp: {grad_inp_str} inp: {inp_str}."
         raise DispatchError(err_msg)
     return impl
 
@@ -929,6 +925,9 @@ class CscTensor:
     @staticmethod
     def from_dense(tensor):
         return CscTensor(scipy.sparse.csc_matrix(tensor))
+    
+    def clone_format(self, tensor):
+        return self.from_dense(tensor)
 
     def to_dense(self):
         return torch.from_numpy(self.data.todense())
