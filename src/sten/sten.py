@@ -52,9 +52,18 @@ class SparseTensorWrapper(torch.Tensor):
             self.grad_fix_hook_handle.remove()
             del self.grad_fix_hook_handle
 
-    def __new__(cls, wrapped_tensor, require_grad=False, grad_fmt=None, dtype=torch.float32, device=torch.device('cpu')):
+    def __new__(
+        cls,
+        wrapped_tensor,
+        require_grad=False,
+        grad_fmt=None,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    ):
         tensor = torch.Tensor._make_subclass(
-            cls, torch.tensor([987654321.123456789], dtype=dtype, device=device), require_grad
+            cls,
+            torch.tensor([987654321.123456789], dtype=dtype, device=device),
+            require_grad,
         )
         tensor.wrapped_tensor = wrapped_tensor
         tensor.update_grad_fix_hook()
@@ -87,7 +96,14 @@ class SparseTensorWrapper(torch.Tensor):
 
 
 class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
-    def __new__(cls, wrapped_tensor, require_grad=True, grad_fmt=None, dtype=torch.float32, device=torch.device('cpu')):
+    def __new__(
+        cls,
+        wrapped_tensor,
+        require_grad=True,
+        grad_fmt=None,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    ):
         return super().__new__(
             cls,
             wrapped_tensor=wrapped_tensor,
@@ -132,10 +148,31 @@ def sparse_default_impl(base_impl, func, types, *args, **kwargs):
 
 
 @implements(torch.Tensor.to)
-def sparse_torch_tensor_to(base_impl, func, types, self, device=None, dtype=None, non_blocking=False, copy=False, memory_format=torch.preserve_format):
-    if (dtype is not None) or non_blocking or copy or (memory_format != torch.preserve_format):
+def sparse_torch_tensor_to(
+    base_impl,
+    func,
+    types,
+    self,
+    device=None,
+    dtype=None,
+    non_blocking=False,
+    copy=False,
+    memory_format=torch.preserve_format,
+):
+    if (
+        (dtype is not None)
+        or non_blocking
+        or copy
+        or (memory_format != torch.preserve_format)
+    ):
         raise Exception("Not implemented")
-    wrapper = SparseTensorWrapper(self.wrapped_tensor, self.requires_grad, self.grad_fmt, dtype=None, device=device)
+    wrapper = SparseTensorWrapper(
+        self.wrapped_tensor,
+        self.requires_grad,
+        self.grad_fmt,
+        dtype=None,
+        device=device,
+    )
     return wrapper
 
 
@@ -171,7 +208,13 @@ def sparse_redirection_property_impl(base_impl, func, types, *args, **kwargs):
     [original_tensor] = args
     result = getattr(original_tensor.wrapped_tensor, func.__self__.__name__)
     if isinstance(result, type(original_tensor.wrapped_tensor)):
-        return SparseTensorWrapper(result, original_tensor.requires_grad, original_tensor.grad_fmt)
+        return SparseTensorWrapper(
+            result,
+            original_tensor.requires_grad,
+            original_tensor.grad_fmt,
+            dtype=original_tensor.dtype,
+            device=original_tensor.device,
+        )
     return result
 
 
@@ -182,6 +225,7 @@ def sparse_redirection_property_impl(base_impl, func, types, *args, **kwargs):
     torch.Tensor.zero_,
     torch.Tensor.__reduce_ex__,
     torch.Tensor.clone,
+    torch.Tensor.reshape,
 )
 def sparse_redirection_function_impl(base_impl, func, types, *args, **kwargs):
     original_tensor = args[0]
@@ -189,7 +233,9 @@ def sparse_redirection_function_impl(base_impl, func, types, *args, **kwargs):
         *(args[1:]), **kwargs
     )
     if isinstance(result, type(original_tensor.wrapped_tensor)):
-        return SparseTensorWrapper(result, original_tensor.requires_grad, original_tensor.grad_fmt)
+        return SparseTensorWrapper(
+            result, original_tensor.requires_grad, original_tensor.grad_fmt
+        )
     return result
 
 
@@ -205,7 +251,7 @@ def torch_tensor_copy_(base_impl, func, types, self, src, non_blocking=False):
     if get_format(self) == torch.Tensor:  # sparse to dense
         self.copy_(src.wrapped_tensor.to_dense())
     elif get_format(src) == torch.Tensor:  # dense to sparse
-        self.wrapped_tensor = self.wrapped_tensor.__class__.from_dense(src)
+        self.wrapped_tensor = self.wrapped_tensor.clone_layout(src)
     else:  # sparse to sparse
         converter = get_sparsifier_implementation(
             KeepAll, get_format(src), get_format(self)
@@ -217,7 +263,7 @@ def torch_tensor_copy_(base_impl, func, types, self, src, non_blocking=False):
 @implements(torch.Tensor.add_)
 def torch_tensor_add_(base_impl, func, types, self, other, *, alpha=1):
     if get_format(self) == torch.Tensor:  # sparse to dense
-        self.add_(other.wrapped_tensor.to_dense(), alpha=alpha)
+        self.add_(other.wrapped_tensor.to_dense().to(device=other.device), alpha=alpha)
     elif get_format(other) == torch.Tensor:  # dense to sparse
         self.wrapped_tensor.add_(other, alpha=alpha)
     else:  # sparse to sparse
@@ -239,9 +285,9 @@ def torch_tensor_mul_(base_impl, func, types, self, tensor1, tensor2, *, value=1
     if get_format(self) == torch.Tensor:  # any to dense
         d1, d2 = tensor1, tensor2
         if hasattr(d1, "wrapped_tensor"):
-            d1 = d1.wrapped_tensor.to_dense()
+            d1 = d1.wrapped_tensor.to_dense().to(device=d1.device)
         if hasattr(d2, "wrapped_tensor"):
-            d2 = d2.wrapped_tensor.to_dense()
+            d2 = d2.wrapped_tensor.to_dense().to(device=d1.device)
         self.addcmul_(d1, d2, value=value)
     elif (
         get_format(tensor1) == torch.Tensor and get_format(tensor2) == torch.Tensor
