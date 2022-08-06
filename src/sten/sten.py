@@ -332,11 +332,19 @@ def densify_params(args, kwargs):
     return dense_args, dense_kwargs
 
 
-@implements(torch.allclose, torch.Tensor.__repr__, torch.zeros_like)
+@implements(torch.allclose, torch.Tensor.__repr__)
 def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
     dense_args, dense_kwargs = densify_params(args, kwargs)
     output = func(*dense_args, **dense_kwargs)
     return output
+
+
+@implements(torch.zeros_like)
+def sparse_torch_zeros_like(base_impl, func, types, *args, **kwargs):
+    [tensor] = args
+    if 'device' not in kwargs:
+        kwargs['device'] = tensor.device
+    return torch.zeros(tensor.shape, **kwargs)
 
 
 ##################
