@@ -47,6 +47,19 @@ def test_simple_graph():
 
 
 def test_modify_transformer_encoder_layer():
+    if torch.__version__.startswith('1.12'):
+        # patch transformer code to remove control flow and make it traceable
+        def patched_forward(self, src, src_mask = None, src_key_padding_mask = None):
+            x = src
+            if self.norm_first:
+                x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask)
+                x = x + self._ff_block(self.norm2(x))
+            else:
+                x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask))
+                x = self.norm2(x + self._ff_block(x))
+            return x
+        torch.nn.TransformerEncoderLayer.forward = patched_forward
+    
     model = torch.nn.TransformerEncoderLayer(d_model=512, nhead=8)
     sb = sten.SparsityBuilder(model)
     # sb.set_weight(name='linear1.weight', initial_sparsifier=sten.ScalarFractionSparsifier, out_format=sten.CooTensor)

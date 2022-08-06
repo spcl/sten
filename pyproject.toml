@@ -6,9 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "sten"
 version = "0.0.1"
 dependencies = [
-    "torch==1.11", # Currently broken with 1.12  
-    "torchvision",
-    "torchaudio",
+    "torch",
     "numpy",
     "scipy",
     "pytest",
