@@ -142,6 +142,7 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     torch.Tensor.device.__get__,
     torch.Tensor.is_sparse.__get__,  # Pretend to be dense to prevent complaints from PyTorch
     torch.Tensor.is_complex,
+    torch.Tensor.element_size,
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
@@ -167,7 +168,7 @@ def sparse_torch_tensor_to(
     ):
         raise Exception("Not implemented")
     wrapper = SparseTensorWrapper(
-        self.wrapped_tensor,
+        self.wrapped_tensor.to(device),
         self.requires_grad,
         self.grad_fmt,
         dtype=None,
@@ -323,6 +324,10 @@ def densify_params(args, kwargs):
     def densify(arg):
         if isinstance(arg, SparseTensorWrapper):
             return arg.wrapped_tensor.to_dense()
+        if isinstance(arg, list):
+            return [densify(x) for x in arg]
+        if isinstance(arg, dict):
+            return {k: densify(v) for k, v in arg.items()}
         else:
             return arg
 
@@ -332,7 +337,12 @@ def densify_params(args, kwargs):
     return dense_args, dense_kwargs
 
 
-@implements(torch.allclose, torch.Tensor.__repr__)
+@implements(
+    torch.allclose,
+    torch.Tensor.__repr__,
+    torch._C._nn.flatten_dense_tensors,
+    torch._C._nn.unflatten_dense_tensors,
+)
 def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
     dense_args, dense_kwargs = densify_params(args, kwargs)
     output = func(*dense_args, **dense_kwargs)
