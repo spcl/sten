@@ -275,7 +275,7 @@ def torch_tensor_add_(base_impl, func, types, self, other, *, alpha=1):
 def torch_tensor_mul_(base_impl, func, types, self, other):
     if get_format(self) == torch.Tensor:  # sparse to dense
         self.mul_(other.wrapped_tensor.to_dense())
-    elif get_format(other) == torch.Tensor:  # dense to sparse
+    elif get_format(other) in (torch.Tensor, None):  # dense to sparse
         self.wrapped_tensor.mul_(other)
     else:  # sparse to sparse
         raise Exception("Not implemented")
@@ -352,6 +352,8 @@ def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
 @implements(torch.zeros_like)
 def sparse_torch_zeros_like(base_impl, func, types, *args, **kwargs):
     [tensor] = args
+    if 'memory_format' in kwargs:
+        del kwargs['memory_format']
     if 'device' not in kwargs:
         kwargs['device'] = tensor.device
     return torch.zeros(tensor.shape, **kwargs)
