@@ -23,25 +23,30 @@ def test_simple_graph():
             ]
         ),
     )
-    x = sten.SparseTensorWrapper(
-        sten.DenseTensor.from_dense(torch.randn(10, 20, requires_grad=True)),
-        require_grad=True,
+    dense_x = torch.randn(10, 20, requires_grad=True)
+    x = sten.torch_tensor_to_wrapped_dense(
+        sten.KeepAll(),
+        dense_x,
+        (
+            sten.RandomFractionSparsifier(0.7),
+            sten.CooTensor,
+            sten.RandomFractionSparsifier(0.9),
+            sten.CsrTensor,
+        )
     )
-    x.grad_fmt = (
-        sten.RandomFractionSparsifier(0.7),
-        sten.CooTensor,
-        sten.RandomFractionSparsifier(0.9),
-        sten.CsrTensor,
+    dense_y = torch.randn(10, 20, requires_grad=True)
+    y = sten.torch_tensor_to_csr(
+        sten.KeepAll(), 
+        dense_y,
+        (sten.KeepAll(), sten.DenseTensor, sten.KeepAll(), sten.DenseTensor),
     )
-    y = sten.SparseTensorWrapper(
-        sten.CsrTensor.from_dense(torch.randn(10, 20, requires_grad=True)),
-        require_grad=True,
-    )
-    y.grad_fmt = (sten.KeepAll(), sten.DenseTensor, sten.KeepAll(), sten.DenseTensor)
     z = sparse_add(x, y)
-    z.backward(
-        sten.SparseTensorWrapper(sten.DenseTensor.from_dense(torch.randn(10, 20)))
+    dense_grad_z = torch.randn(10, 20)
+    grad_z = sten.torch_tensor_to_wrapped_dense(
+        sten.KeepAll(),
+        dense_grad_z,
     )
+    z.backward(grad_z)
     assert isinstance(x.grad.wrapped_tensor, sten.CsrTensor)
     assert isinstance(y.grad.wrapped_tensor, sten.DenseTensor)
 
@@ -65,7 +70,7 @@ def test_modify_transformer_encoder_layer():
     # sb.set_weight(name='linear1.weight', initial_sparsifier=sten.ScalarFractionSparsifier, out_format=sten.CooTensor)
     sb.set_interm(
         name="relu",
-        external_sparsifier=sten.ScalarFractionSparsifier,
+        external_sparsifier=sten.ScalarFractionSparsifier(0.5),
         out_format=sten.CooTensor,
     )
     sparse_model = sb.get_sparse_model()
@@ -93,25 +98,25 @@ class SparseLinear(torch.nn.Module):
     def __init__(self, input_features, output_features, weight_sparsity):
         super().__init__()
         self.weight_sparsity = weight_sparsity
-        dense_weight = sten.random_mask_sparsify(
-            torch.randn(output_features, input_features), frac=weight_sparsity
-        )
         self.weight = sten.SparseParameterWrapper(
-            sten.CscTensor.from_dense(dense_weight)
-        )
-        self.weight.grad_fmt = (
-            sten.KeepAll(),
-            torch.Tensor,
-            sten.RandomFractionSparsifier(self.weight_sparsity),
-            sten.CscTensor,
+            sten.random_fraction_sparsifier_dense_csc(
+                sten.RandomFractionSparsifier(self.weight_sparsity),
+                torch.randn(output_features, input_features),
+                (
+                    sten.KeepAll(),
+                    torch.Tensor,
+                    sten.RandomFractionSparsifier(self.weight_sparsity),
+                    sten.CscTensor,
+                )
+            )
         )
         self.bias = torch.nn.Parameter(torch.rand(output_features))
-        self.bias.grad_fmt = (
-            sten.KeepAll(),
-            torch.Tensor,
-            sten.KeepAll(),
-            torch.Tensor,
-        )
+        # self.bias.grad_fmt = (
+        #     sten.KeepAll(),
+        #     torch.Tensor,
+        #     sten.KeepAll(),
+        #     torch.Tensor,
+        # )
 
     def forward(self, input):
         sparse_op = sten.sparsified_op(
@@ -243,19 +248,19 @@ class MyCscTensor:
     def __init__(self, data):
         self.data = data
 
-    @staticmethod
-    def from_dense(tensor):
-        return MyCscTensor(scipy.sparse.csc_matrix(tensor))
+    # @staticmethod
+    # def from_dense(tensor):
+    #     return MyCscTensor(scipy.sparse.csc_matrix(tensor))
 
-    def to_dense(self):
-        return torch.from_numpy(self.data.todense())
+    # def to_dense(self):
+    #     return torch.from_numpy(self.data.todense())
 
-    @property
-    def shape(self):
-        return torch.Size(self.data.shape)
+    # @property
+    # def shape(self):
+    #     return torch.Size(self.data.shape)
 
-    def size(self):
-        return torch.Size(self.data.shape)
+    # def size(self):
+    #     return torch.Size(self.data.shape)
 
 
 @sten.register_fwd_op_impl(
@@ -272,10 +277,9 @@ def sparse_add_fwd_impl(ctx, inputs, output_sparsifiers):
     sparsifer=MyRandomFractionSparsifier, inp=torch.Tensor, out=MyCscTensor
 )
 def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
-    return sten.SparseTensorWrapper(
-        MyCscTensor.from_dense(
-            sten.random_mask_sparsify(tensor, frac=sparsifier.fraction)
-        )
+    return sten.SparseTensorWrapper.wrapped_from_dense(
+        MyCscTensor(scipy.sparse.csc_matrix(sten.random_mask_sparsify(tensor, frac=sparsifier.fraction))),
+        tensor,
     )
 
 
@@ -321,8 +325,8 @@ def torch_mm_bwd_impl(ctx, grad_outputs, input_sparsifiers):
 )
 def torch_add_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     [grad_output] = grad_outputs
-    dense_output = grad_output.wrapped_tensor.to_dense()
-    return dense_output, dense_output, None, None
+    dense_output = torch.from_numpy(grad_output.wrapped_tensor.data.todense())
+    return dense_output.clone().detach(), dense_output.clone().detach(), None, None
 
 
 class MyRandomFractionSparsifierFallback:
@@ -334,19 +338,19 @@ class MyCscTensorFallback:
     def __init__(self, data):
         self.data = data
 
-    @staticmethod
-    def from_dense(tensor):
-        return MyCscTensor(scipy.sparse.csc_matrix(tensor))
-
     def to_dense(self):
         return torch.from_numpy(self.data.todense())
 
-    @property
-    def shape(self):
-        return torch.Size(self.data.shape)
 
-    def size(self):
-        return torch.Size(self.data.shape)
+@sten.register_sparsifier_implementation(
+    sparsifer=MyRandomFractionSparsifierFallback, inp=torch.Tensor, out=MyCscTensorFallback
+)
+def my_default_sparsifier(sparsifier, tensor, grad_fmt=None):
+    return sten.SparseTensorWrapper.wrapped_from_dense(
+        MyCscTensorFallback(scipy.sparse.csc_matrix(sten.random_mask_sparsify(tensor, frac=sparsifier.fraction))),
+        tensor,
+        grad_fmt
+    )
 
 
 def add_mm_implementations(sparsifier_cls, tensor_cls):
