@@ -21,4 +21,7 @@ dependencies = [
     "importlib-metadata",
     "tabulate",
     "black",
+    "coverage",
+    "pytest-cov",
+    "pytest-xdist",
 ]
