@@ -846,7 +846,7 @@ def collapse_none_tuples(tuple_list):
     return tuple((None if is_tuple_of_none(t) else t) for t in tuple_list)
 
 
-def create_fallback_fwd_impl(orig_op, out_fmts):
+def create_fallback_fwd_impl(out_fmts):
     def fallback_fwd_impl(ctx, inputs, output_sparsifiers):
         fallback_inputs, _ = densify_params(inputs, {})
         fallback_inputs = tuple(
@@ -875,7 +875,7 @@ def create_fallback_fwd_impl(orig_op, out_fmts):
 #
 
 
-def create_fallback_bwd_impl(orig_op, grad_inp_fmts):
+def create_fallback_bwd_impl(grad_inp_fmts):
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
         fallback_grad_outputs, _ = densify_params(grad_outputs, {})
         dense_fallback_inputs, _ = densify_params(ctx.saved_inputs, {})
@@ -939,7 +939,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         except DispatchError as e:
             if DISPATCH_FAILURE == DISPATCH_WARN:
                 logging.warning(f"{str(e)}. Fallback to dense implementation.")
-                op_impl = create_fallback_fwd_impl(orig_op, fmt1)
+                op_impl = create_fallback_fwd_impl(fmt1)
             else:
                 raise e
         tmp_outputs = op_impl(ctx, args, sp1)
@@ -967,7 +967,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         except DispatchError as e:
             if DISPATCH_FAILURE == DISPATCH_WARN:
                 logging.warning(f"{str(e)}. Fallback to dense implementation.")
-                op_impl = create_fallback_bwd_impl(ctx.orig_op, fmt1)
+                op_impl = create_fallback_bwd_impl(fmt1)
             else:
                 raise e
         tmp_grad_inputs = op_impl(ctx, args, sp1)
