@@ -32,11 +32,11 @@ def test_simple_graph():
             sten.CooTensor,
             sten.RandomFractionSparsifier(0.9),
             sten.CsrTensor,
-        )
+        ),
     )
     dense_y = torch.randn(10, 20, requires_grad=True)
     y = sten.torch_tensor_to_csr(
-        sten.KeepAll(), 
+        sten.KeepAll(),
         dense_y,
         (sten.KeepAll(), sten.DenseTensor, sten.KeepAll(), sten.DenseTensor),
     )
@@ -52,9 +52,9 @@ def test_simple_graph():
 
 
 def test_modify_transformer_encoder_layer():
-    if torch.__version__.startswith('1.12'):
+    if torch.__version__.startswith("1.12"):
         # patch transformer code to remove control flow and make it traceable
-        def patched_forward(self, src, src_mask = None, src_key_padding_mask = None):
+        def patched_forward(self, src, src_mask=None, src_key_padding_mask=None):
             x = src
             if self.norm_first:
                 x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask)
@@ -63,8 +63,9 @@ def test_modify_transformer_encoder_layer():
                 x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask))
                 x = self.norm2(x + self._ff_block(x))
             return x
+
         torch.nn.TransformerEncoderLayer.forward = patched_forward
-    
+
     model = torch.nn.TransformerEncoderLayer(d_model=512, nhead=8)
     sb = sten.SparsityBuilder(model)
     # sb.set_weight(name='linear1.weight', initial_sparsifier=sten.ScalarFractionSparsifier, out_format=sten.CooTensor)
@@ -107,16 +108,10 @@ class SparseLinear(torch.nn.Module):
                     torch.Tensor,
                     sten.RandomFractionSparsifier(self.weight_sparsity),
                     sten.CscTensor,
-                )
+                ),
             )
         )
         self.bias = torch.nn.Parameter(torch.rand(output_features))
-        # self.bias.grad_fmt = (
-        #     sten.KeepAll(),
-        #     torch.Tensor,
-        #     sten.KeepAll(),
-        #     torch.Tensor,
-        # )
 
     def forward(self, input):
         sparse_op = sten.sparsified_op(
@@ -248,20 +243,6 @@ class MyCscTensor:
     def __init__(self, data):
         self.data = data
 
-    # @staticmethod
-    # def from_dense(tensor):
-    #     return MyCscTensor(scipy.sparse.csc_matrix(tensor))
-
-    # def to_dense(self):
-    #     return torch.from_numpy(self.data.todense())
-
-    # @property
-    # def shape(self):
-    #     return torch.Size(self.data.shape)
-
-    # def size(self):
-    #     return torch.Size(self.data.shape)
-
 
 @sten.register_fwd_op_impl(
     operator=torch.add,
@@ -278,7 +259,11 @@ def sparse_add_fwd_impl(ctx, inputs, output_sparsifiers):
 )
 def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
     return sten.SparseTensorWrapper.wrapped_from_dense(
-        MyCscTensor(scipy.sparse.csc_matrix(sten.random_mask_sparsify(tensor, frac=sparsifier.fraction))),
+        MyCscTensor(
+            scipy.sparse.csc_matrix(
+                sten.random_mask_sparsify(tensor, frac=sparsifier.fraction)
+            )
+        ),
         tensor,
     )
 
@@ -343,13 +328,19 @@ class MyCscTensorFallback:
 
 
 @sten.register_sparsifier_implementation(
-    sparsifer=MyRandomFractionSparsifierFallback, inp=torch.Tensor, out=MyCscTensorFallback
+    sparsifer=MyRandomFractionSparsifierFallback,
+    inp=torch.Tensor,
+    out=MyCscTensorFallback,
 )
 def my_default_sparsifier(sparsifier, tensor, grad_fmt=None):
     return sten.SparseTensorWrapper.wrapped_from_dense(
-        MyCscTensorFallback(scipy.sparse.csc_matrix(sten.random_mask_sparsify(tensor, frac=sparsifier.fraction))),
+        MyCscTensorFallback(
+            scipy.sparse.csc_matrix(
+                sten.random_mask_sparsify(tensor, frac=sparsifier.fraction)
+            )
+        ),
         tensor,
-        grad_fmt
+        grad_fmt,
     )
 
 

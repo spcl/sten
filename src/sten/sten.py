@@ -83,7 +83,7 @@ class SparseTensorWrapper(torch.Tensor):
         tensor.update_grad_fix_hook()
         tensor.grad_fmt = grad_fmt
         return tensor
-    
+
     def init_from_other(self, other):
         assert isinstance(other, SparseTensorWrapper)
         self.wrapped_tensor = other.wrapped_tensor
@@ -120,8 +120,10 @@ class SparseTensorWrapper(torch.Tensor):
 class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     @staticmethod
     def wrapped_from_dense(wrapped_tensor, dense_tensor, grad_fmt=None):
-        raise Exception("Do not use this, instead call wrapped_from_dense of SparseTensorWrapper and then wrap")
-    
+        raise Exception(
+            "Do not use this, instead call wrapped_from_dense of SparseTensorWrapper and then wrap"
+        )
+
     def __new__(
         cls,
         sparse_tensor_wrapper,
@@ -262,7 +264,7 @@ def sparse_functional_fallback(base_impl, func, types, *args, **kwargs):
             result, original_tensor.requires_grad, original_tensor.grad_fmt
         )
     return result
-    
+
 
 # case 2
 @implements(
@@ -283,6 +285,7 @@ def sparse_reference_fallback(base_impl, func, types, *args, **kwargs):
     copied_tensor.wrapped_tensor = original_tensor.wrapped_tensor
     return copied_tensor
 
+
 # case 3
 @implements(
     torch.Tensor.shape.__get__,
@@ -293,6 +296,7 @@ def sparse_read_only_fallback(base_impl, func, types, *args, **kwargs):
     """
     d_args, d_kwargs = densify_params(args, kwargs)
     return func(*d_args, *d_kwargs)
+
 
 # case 4
 @implements(torch.Tensor.copy_)
@@ -305,12 +309,16 @@ def torch_modify_inplace_fallback(base_impl, func, types, *args, **kwargs):
     resparsify_params(args, kwargs, d_args, d_kwargs)
     return output
 
+
 # ======================= fallback implementations =======================
+
 
 def resparsify_params(args, kwargs, changed_args, changed_kwargs):
     def resparsify(arg, changed_arg):
         if isinstance(arg, SparseTensorWrapper):
-            sparsifier = get_sparsifier_implementation(SameFormatSparsifier, torch.Tensor, arg.wrapped_tensor.__class__)
+            sparsifier = get_sparsifier_implementation(
+                SameFormatSparsifier, torch.Tensor, arg.wrapped_tensor.__class__
+            )
             sparse_arg = sparsifier(SameFormatSparsifier(arg), changed_arg)
             arg.init_from_other(sparse_arg)
             return arg.wrapped_tensor.to_dense()
@@ -459,10 +467,10 @@ def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
 @implements(torch.zeros_like)
 def sparse_torch_zeros_like(base_impl, func, types, *args, **kwargs):
     [tensor] = args
-    if 'memory_format' in kwargs:
-        del kwargs['memory_format']
-    if 'device' not in kwargs:
-        kwargs['device'] = tensor.device
+    if "memory_format" in kwargs:
+        del kwargs["memory_format"]
+    if "device" not in kwargs:
+        kwargs["device"] = tensor.device
     return torch.zeros(tensor.shape, **kwargs)
 
 
@@ -654,7 +662,9 @@ class SparsityBuilder:
                     initial_sparsifier.__class__, torch.Tensor, fmt2
                 )
                 sparse_tensor = initial_sparsifier_instance(
-                    initial_sparsifier, original_tensor, (grad_sp1, grad_fmt1, grad_sp2, grad_fmt2)
+                    initial_sparsifier,
+                    original_tensor,
+                    (grad_sp1, grad_fmt1, grad_sp2, grad_fmt2),
                 )
                 wrapper = SparseParameterWrapper(sparse_tensor)
                 setattr(direct_module, direct_name, wrapper)
@@ -705,7 +715,9 @@ SPARSIFIER_IMPLEMENTATIONS = {}
 def register_sparsifier_implementation(sparsifer, inp, out):
     def decorator(func):
         if (sparsifer, inp, out) in SPARSIFIER_IMPLEMENTATIONS:
-            raise Exception("Trying to register sparsifier implementation second time! Use unregister_sparsifier_implementation to remove existing implementation.")
+            raise Exception(
+                "Trying to register sparsifier implementation second time! Use unregister_sparsifier_implementation to remove existing implementation."
+            )
         SPARSIFIER_IMPLEMENTATIONS[(sparsifer, inp, out)] = func
         return func  # func is not modified
 
@@ -726,14 +738,20 @@ def get_sparsifier_implementation(sparsifier, inp, out):
     impl = SPARSIFIER_IMPLEMENTATIONS.get((sparsifier, inp, out))
     if impl is None:
         err_msg = f"Sparsifier implementation is not registered. sparsifier: {sparsifier} inp: {inp} out: {out}."
-        if DISPATCH_FAILURE == DISPATCH_WARN and inp != torch.Tensor:            
-            logging.warning(f"{err_msg} Use fallback implementation. {sparsifier} inp: {torch.Tensor} out: {out}")
+        if DISPATCH_FAILURE == DISPATCH_WARN and inp != torch.Tensor:
+            logging.warning(
+                f"{err_msg} Use fallback implementation. {sparsifier} inp: {torch.Tensor} out: {out}"
+            )
             # we can try to use fallback implementation input_format1 -> torch.Tensor -> sparsifier -> input_format2
             # instead of input_format1 -> sparsifier -> input_format2
-            fallback_sparsifier = get_sparsifier_implementation((sparsifier, torch.Tensor, out))
+            fallback_sparsifier = get_sparsifier_implementation(
+                (sparsifier, torch.Tensor, out)
+            )
+
             def full_sparsifier(sparsifier, tensor):
                 dense_input = tensor.wrapped_tensor.to_dense()
                 return fallback_sparsifier(sparsifier, dense_input)
+
             return full_sparsifier
         else:
             raise DispatchError(err_msg)
@@ -754,7 +772,7 @@ def register_fwd_op_impl(operator, inp, out):
 def pretty_name(obj):
     if isinstance(obj, (list, tuple)):
         return type(obj)([pretty_name(o) for o in obj])
-    if hasattr(obj, '__module__') and hasattr(obj, '__qualname__'):
+    if hasattr(obj, "__module__") and hasattr(obj, "__qualname__"):
         return f"{obj.__module__}.{obj.__qualname__}"
     return str(obj)
 
@@ -877,18 +895,24 @@ def create_fallback_fwd_impl(orig_op, out_fmts):
 
 #
 
+
 def create_fallback_bwd_impl(orig_op, grad_inp_fmts):
     orig_op_wrp = get_func_wrapper(orig_op)
 
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
         fallback_grad_outputs, _ = densify_params(grad_outputs, {})
         dense_fallback_inputs, _ = densify_params(ctx.saved_inputs, {})
-        fallback_inputs = tuple((i.detach().requires_grad_() if isinstance(i, torch.Tensor) else i) for i in dense_fallback_inputs)
-        #*fallback_inputs, fallback_outputs = ctx.saved_tensors
+        fallback_inputs = tuple(
+            (i.detach().requires_grad_() if isinstance(i, torch.Tensor) else i)
+            for i in dense_fallback_inputs
+        )
+        # *fallback_inputs, fallback_outputs = ctx.saved_tensors
         with torch.enable_grad():
             fallback_outputs = orig_op_wrp(*fallback_inputs)
             fallback_outputs.backward(fallback_grad_outputs)
-        fallback_grad_inputs_with_none = [getattr(inp, 'grad', None) for inp in fallback_inputs]
+        fallback_grad_inputs_with_none = [
+            getattr(inp, "grad", None) for inp in fallback_inputs
+        ]
         grad_inputs = tuple(
             (
                 grad_inp
@@ -965,7 +989,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         except DispatchError as e:
             if DISPATCH_FAILURE == DISPATCH_WARN:
                 logging.warning(f"{str(e)}. Fallback to dense implementation.")
-                op_impl = create_fallback_bwd_impl(ctx.orig_op, fmt1)      
+                op_impl = create_fallback_bwd_impl(ctx.orig_op, fmt1)
             else:
                 raise e
         tmp_grad_inputs = op_impl(ctx, args, sp1)
@@ -1086,9 +1110,7 @@ def torch_tensor_to_wrapped_dense(sparsifier, tensor, grad_fmt=None):
     )
 
 
-@register_sparsifier_implementation(
-    sparsifer=KeepAll, inp=torch.Tensor, out=CsrTensor
-)
+@register_sparsifier_implementation(sparsifer=KeepAll, inp=torch.Tensor, out=CsrTensor)
 def torch_tensor_to_csr(sparsifier, tensor, grad_fmt=None):
     return SparseTensorWrapper.wrapped_from_dense(
         CsrTensor(tensor.to_sparse_csr()),
@@ -1097,9 +1119,7 @@ def torch_tensor_to_csr(sparsifier, tensor, grad_fmt=None):
     )
 
 
-@register_sparsifier_implementation(
-    sparsifer=KeepAll, inp=torch.Tensor, out=CooTensor
-)
+@register_sparsifier_implementation(sparsifer=KeepAll, inp=torch.Tensor, out=CooTensor)
 def torch_tensor_to_coo(sparsifier, tensor, grad_fmt=None):
     return SparseTensorWrapper.wrapped_from_dense(
         CooTensor(tensor.to_sparse_coo()),
@@ -1117,7 +1137,8 @@ def torch_tensor_to_coo_scalar_fraction(sparsifier, tensor, grad_fmt=None):
         tensor,
         grad_fmt,
     )
-    
+
+
 @register_sparsifier_implementation(
     sparsifer=RandomFractionSparsifier, inp=torch.Tensor, out=CooTensor
 )
@@ -1134,7 +1155,9 @@ def torch_tensor_to_coo_random_fraction(sparsifier, tensor, grad_fmt=None):
 )
 def random_fraction_sparsifier_coo_csr(sparsifier, tensor, grad_fmt=None):
     dense = tensor.wrapped_tensor.to_dense()
-    return torch_tensor_to_csr(KeepAll(), random_mask_sparsify(dense, sparsifier.fraction), grad_fmt)
+    return torch_tensor_to_csr(
+        KeepAll(), random_mask_sparsify(dense, sparsifier.fraction), grad_fmt
+    )
 
 
 @register_sparsifier_implementation(
@@ -1142,12 +1165,16 @@ def random_fraction_sparsifier_coo_csr(sparsifier, tensor, grad_fmt=None):
 )
 def random_fraction_sparsifier_dense_csc(sparsifier, tensor, grad_fmt=None):
     return SparseTensorWrapper.wrapped_from_dense(
-        CscTensor(scipy.sparse.csc_matrix(random_mask_sparsify(tensor, frac=sparsifier.fraction))),
+        CscTensor(
+            scipy.sparse.csc_matrix(
+                random_mask_sparsify(tensor, frac=sparsifier.fraction)
+            )
+        ),
         tensor,
         grad_fmt,
     )
-    
-    
+
+
 @register_sparsifier_implementation(
     sparsifer=SameFormatSparsifier, inp=torch.Tensor, out=CscTensor
 )
@@ -1178,9 +1205,7 @@ def random_fraction_sparsifier_dense_csr(sparsifier, tensor, grad_fmt=None):
 )
 def scalar_fraction_sparsifier_dense_csr(sparsifier, tensor, grad_fmt=None):
     return torch_tensor_to_csr(
-        KeepAll(),
-        random_mask_sparsify(tensor, sparsifier.fraction),
-        grad_fmt
+        KeepAll(), random_mask_sparsify(tensor, sparsifier.fraction), grad_fmt
     )
 
 
@@ -1228,7 +1253,9 @@ def sparse_torch_add_fwd_impl(ctx, inputs, output_sparsifiers):
         alpha=alpha,
         out=out,
     )  # TODO make it really sparse
-    return torch_tensor_to_csr(KeepAll(), random_mask_sparsify(dense_out, out_sp.fraction))
+    return torch_tensor_to_csr(
+        KeepAll(), random_mask_sparsify(dense_out, out_sp.fraction)
+    )
 
 
 @register_fwd_op_impl(
