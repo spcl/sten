@@ -705,11 +705,15 @@ SPARSIFIER_IMPLEMENTATIONS = {}
 def register_sparsifier_implementation(sparsifer, inp, out):
     def decorator(func):
         if (sparsifer, inp, out) in SPARSIFIER_IMPLEMENTATIONS:
-            raise Exception("Trying to register sparsifier implementation second time!")
+            raise Exception("Trying to register sparsifier implementation second time! Use unregister_sparsifier_implementation to remove existing implementation.")
         SPARSIFIER_IMPLEMENTATIONS[(sparsifer, inp, out)] = func
         return func  # func is not modified
 
     return decorator
+
+
+def unregister_sparsifier_implementation(sparsifer, inp, out):
+    del SPARSIFIER_IMPLEMENTATIONS[(sparsifer, inp, out)]
 
 
 def get_sparsifier_implementation(sparsifier, inp, out):
