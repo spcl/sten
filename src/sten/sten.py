@@ -809,29 +809,11 @@ def get_bwd_op_impl(operator, grad_out, grad_inp, inp):
     return impl
 
 
-FUNC_WRAPPERS = {}
-
-
-def register_func_wrapper(original_func):
-    def impl(func):
-        FUNC_WRAPPERS[original_func] = func
-        return func
-
-    return impl
-
-
-def get_func_wrapper(original_func):
-    f = FUNC_WRAPPERS.get(original_func)
-    if f is not None:
-        return f
-    try:
-        signature = inspect.signature(original_func)
-    except:
-        raise KeyError(
-            f"Function wrapper for function {original_func} is not registered and signature can't be guessed automaticaly."
-        )
-
-    return original_func
+def get_func_signature(original_func):
+    override_dict = torch.overrides.get_testing_overrides()
+    dummy_func = override_dict[original_func]
+    signature = inspect.signature(dummy_func)
+    return signature
 
 
 def simplify_tensor_tuple(tensors):
@@ -865,8 +847,6 @@ def collapse_none_tuples(tuple_list):
 
 
 def create_fallback_fwd_impl(orig_op, out_fmts):
-    orig_op_wrp = get_func_wrapper(orig_op)
-
     def fallback_fwd_impl(ctx, inputs, output_sparsifiers):
         fallback_inputs, _ = densify_params(inputs, {})
         fallback_inputs = tuple(
@@ -876,17 +856,16 @@ def create_fallback_fwd_impl(orig_op, out_fmts):
         for inp in fallback_inputs:
             if isinstance(inp, torch.Tensor):
                 inp.requires_grad_()
+        args_dict = get_func_signature(ctx.orig_op).bind(*fallback_inputs).arguments
         with torch.enable_grad():
-            fallback_outputs = orig_op_wrp(*fallback_inputs)
+            fallback_outputs = ctx.orig_op(**args_dict)
         fallback_outputs = canonicalize_tensor_tuple(fallback_outputs)
-        outputs = [
-            (
-                out.detach()
-                if issubclass(out_fmt, torch.Tensor)
-                else SparseTensorWrapper(out_fmt.__class__.from_dense(out.detach()))
+        outputs = []
+        for out_fmt, out_sp, out in zip(out_fmts, output_sparsifiers, fallback_outputs):
+            sp_impl = get_sparsifier_implementation(
+                out_sp.__class__, torch.Tensor, out_fmt
             )
-            for out_fmt, out in zip(out_fmts, fallback_outputs)
-        ]
+            outputs.append(sp_impl(out_sp, out))
         outputs = simplify_tensor_tuple(outputs)
         return outputs
 
@@ -897,8 +876,6 @@ def create_fallback_fwd_impl(orig_op, out_fmts):
 
 
 def create_fallback_bwd_impl(orig_op, grad_inp_fmts):
-    orig_op_wrp = get_func_wrapper(orig_op)
-
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
         fallback_grad_outputs, _ = densify_params(grad_outputs, {})
         dense_fallback_inputs, _ = densify_params(ctx.saved_inputs, {})
@@ -906,23 +883,24 @@ def create_fallback_bwd_impl(orig_op, grad_inp_fmts):
             (i.detach().requires_grad_() if isinstance(i, torch.Tensor) else i)
             for i in dense_fallback_inputs
         )
-        # *fallback_inputs, fallback_outputs = ctx.saved_tensors
+        args_dict = get_func_signature(ctx.orig_op).bind(*fallback_inputs).arguments
         with torch.enable_grad():
-            fallback_outputs = orig_op_wrp(*fallback_inputs)
+            fallback_outputs = ctx.orig_op(**args_dict)
             fallback_outputs.backward(fallback_grad_outputs)
         fallback_grad_inputs_with_none = [
             getattr(inp, "grad", None) for inp in fallback_inputs
         ]
-        grad_inputs = tuple(
-            (
-                grad_inp
-                if (grad_inp_fmt is None or issubclass(grad_inp_fmt, torch.Tensor))
-                else SparseTensorWrapper(grad_inp_fmt.__class__.from_dense(grad_inp))
-            )
-            for grad_inp_fmt, grad_inp in zip(
-                grad_inp_fmts, fallback_grad_inputs_with_none
-            )
-        )
+        grad_inputs = []
+        for grad_inp_fmt, grad_inp_sp, grad_inp in zip(
+            grad_inp_fmts, input_sparsifiers, fallback_grad_inputs_with_none
+        ):
+            if grad_inp is None:
+                grad_inputs.append(None)
+            else:
+                sp_impl = get_sparsifier_implementation(
+                    grad_inp_sp.__class__, torch.Tensor, grad_inp_fmt
+                )
+                grad_inputs.append(sp_impl(grad_inp_sp, grad_inp))
         return grad_inputs
 
     return fallback_bwd_impl
@@ -1010,8 +988,7 @@ def sparsified_op(orig_op, out_fmt, grad_out_fmt):
 
     def sparse_op(*args, **kwargs):
         # here we want to linearize kwargs using the signature of original function
-        func_wrapper = get_func_wrapper(orig_op)
-        func_sign = inspect.signature(func_wrapper)
+        func_sign = get_func_signature(orig_op)
         bound_args = func_sign.bind(*args, **kwargs)
         bound_args.apply_defaults()
         # arguments in the order of definition
@@ -1194,7 +1171,9 @@ def same_format_sparsifier_dense_csc(sparsifier, tensor, grad_fmt=None):
 )
 def random_fraction_sparsifier_dense_csr(sparsifier, tensor, grad_fmt=None):
     return SparseTensorWrapper.wrapped_from_dense(
-        CsrTensor.from_dense(random_mask_sparsify(tensor, frac=sparsifier.fraction)),
+        CsrTensor(
+            random_mask_sparsify(tensor, frac=sparsifier.fraction).to_sparse_csr()
+        ),
         tensor,
         grad_fmt,
     )
@@ -1210,31 +1189,6 @@ def scalar_fraction_sparsifier_dense_csr(sparsifier, tensor, grad_fmt=None):
 
 
 # ====================== Sparsifier implementations ======================
-
-# ++++++++++++++++++++++ Operator signatures ++++++++++++++++++++++
-
-
-@register_func_wrapper(torch.add)
-def torch_add_sign(input, other, alpha=1, out=None):
-    return torch.add(input, other, alpha=alpha, out=out)
-
-
-@register_func_wrapper(torch.nn.functional.linear)
-def torch_nn_functional_linear_sign(input, weight, bias=None):
-    return torch.nn.functional.linear(input, weight, bias)
-
-
-@register_func_wrapper(torch.nn.functional.gelu)
-def torch_add_sign(input):
-    return torch.nn.functional.gelu(input)
-
-
-@register_func_wrapper(torch.mm)
-def torch_nn_functional_linear_sign(input, mat2):
-    return torch.mm(input, mat2)
-
-
-# ====================== Operator signatures ======================
 
 # ++++++++++++++++++++++ Forward operator implementations ++++++++++++++++++++++
 @register_fwd_op_impl(

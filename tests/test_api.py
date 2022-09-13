@@ -243,6 +243,9 @@ class MyCscTensor:
     def __init__(self, data):
         self.data = data
 
+    def to_dense(self):
+        return torch.from_numpy(self.data.todense())
+
 
 @sten.register_fwd_op_impl(
     operator=torch.add,
