@@ -5,6 +5,7 @@ import scipy, scipy.sparse
 
 
 def test_simple_graph():
+    sten.set_dispatch_failure("raise")
     sparse_add = sten.sparsified_op(
         orig_op=torch.add,
         out_fmt=tuple(
@@ -52,6 +53,7 @@ def test_simple_graph():
 
 
 def test_modify_transformer_encoder_layer():
+    sten.set_dispatch_failure("warn")
     if torch.__version__.startswith("1.12"):
         # patch transformer code to remove control flow and make it traceable
         def patched_forward(self, src, src_mask=None, src_key_padding_mask=None):
@@ -68,13 +70,19 @@ def test_modify_transformer_encoder_layer():
 
     model = torch.nn.TransformerEncoderLayer(d_model=512, nhead=8)
     sb = sten.SparsityBuilder(model)
-    # sb.set_weight(name='linear1.weight', initial_sparsifier=sten.ScalarFractionSparsifier, out_format=sten.CooTensor)
+    sb.set_weight(
+        name="linear1.weight",
+        initial_sparsifier=sten.ScalarFractionSparsifier(0.5),
+        out_format=sten.CooTensor,
+    )
     sb.set_interm(
         name="relu",
         external_sparsifier=sten.ScalarFractionSparsifier(0.5),
         out_format=sten.CooTensor,
     )
     sparse_model = sb.get_sparse_model()
+    assert isinstance(sparse_model.linear1.weight, sten.SparseParameterWrapper)
+    assert isinstance(sparse_model.linear1.weight.wrapped_tensor, sten.CooTensor)
     sparse_model(torch.randn(8, 128, 512))
 
 
@@ -141,6 +149,7 @@ class SparseMLP(torch.nn.Module):
 
 
 def test_build_mlp_from_scratch():
+    sten.set_dispatch_failure("raise")
     input = torch.randn(15, 50)
     channel_sizes = [50, 40, 30, 20, 30, 10]
 
@@ -182,6 +191,7 @@ def test_build_mlp_from_scratch():
 
 
 def test_modify_bert_encoder():
+    sten.set_dispatch_failure("raise")
     model = torch.hub.load(
         "huggingface/pytorch-transformers", "model", "bert-base-uncased"
     ).encoder.layer[0]
@@ -307,9 +317,8 @@ def torch_mm_bwd_impl(ctx, grad_outputs, input_sparsifiers):
         (sten.KeepAll, torch.Tensor),
         (sten.KeepAll, torch.Tensor),
         None,
-        None,
     ),
-    inp=(torch.Tensor, torch.Tensor, None, None),
+    inp=(torch.Tensor, torch.Tensor, None),
 )
 def torch_add_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     [grad_output] = grad_outputs
@@ -407,10 +416,12 @@ def add_mm_implementations(sparsifier_cls, tensor_cls):
 
 
 def test_custom_implementations():
+    sten.set_dispatch_failure("raise")
     add_mm_implementations(MyRandomFractionSparsifier, MyCscTensor)
 
 
 def test_fallback_implementations():
+    sten.set_dispatch_failure("warn")
     add_mm_implementations(MyRandomFractionSparsifierFallback, MyCscTensorFallback)
 
 
