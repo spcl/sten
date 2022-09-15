@@ -987,7 +987,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                 return (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
             return (None, None, None, None)
 
-        ctx.inp_fmt = tuple(get_format(a) for a in args)
+        inp_fmt = tuple(get_format(a) for a in args)
         ctx.grad_inp_fmt = tuple(find_gradient_fmt(a) for a in args)
         ctx.orig_op = orig_op
         sp1, fmt1, sp2, fmt2 = tuple(zip(*out_fmt))
@@ -1013,10 +1013,10 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 
         # find implementation for the forward pass
         try:
-            op_impl_fwd = get_fwd_op_impl(orig_op, ctx.inp_fmt, op_out_fmt)
+            op_impl_fwd = get_fwd_op_impl(orig_op, inp_fmt, op_out_fmt)
         except DispatchError as e:
             # are all types are trivially reducible to dense?
-            trivially_dense = check_dense_inputs(ctx.inp_fmt) and check_dense_outputs(
+            trivially_dense = check_dense_inputs(inp_fmt) and check_dense_outputs(
                 op_out_fmt
             )
 
@@ -1032,13 +1032,13 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 
         # find implementation for the backward pass
         try:
-            ctx.op_impl_bwd = get_bwd_op_impl(orig_op, gfmt2, op_ginp_fmt, ctx.inp_fmt)
+            ctx.op_impl_bwd = get_bwd_op_impl(orig_op, gfmt2, op_ginp_fmt, inp_fmt)
         except DispatchError as e:
             # are all types are trivially reducible to dense?
             trivially_dense = (
                 check_dense_inputs(gfmt2)
                 and check_dense_outputs(op_ginp_fmt)
-                and check_dense_inputs(ctx.inp_fmt)
+                and check_dense_inputs(inp_fmt)
             )
 
             if trivially_dense:
