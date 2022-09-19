@@ -9,6 +9,10 @@ import logging
 import itertools
 
 
+
+_log = logging.getLogger(__name__)
+
+
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
 
 # ++++++++++++++++++++++ Dispatch defaults ++++++++++++++++++++++
@@ -108,21 +112,9 @@ class SparseTensorWrapper(torch.Tensor):
         if kwargs is None:
             kwargs = {}
         if func not in HANDLED_FUNCTIONS:
-            if func.__qualname__ in (
-                "getset_descriptor.__get__",
-                "getset_descriptor.__set__",
-            ):
-                funcself = func.__self__
-            else:
-                funcself = ""
-            err_msg = f"SparseTensorWrapper function is not explicitly registered: {func} {funcself}."
-            if DISPATCH_FAILURE == DISPATCH_WARN:
-                logging.warning(f"{err_msg} Fallback to dense implementation.")
-                return sparse_autoconvert_impl(
-                    super().__torch_function__, func, types, *args, **kwargs
-                )
-            else:
-                raise DispatchError(err_msg)
+            return sparse_fallback(
+                super().__torch_function__, func, types, *args, **kwargs
+            )
         return HANDLED_FUNCTIONS[func](
             super().__torch_function__, func, types, *args, **kwargs
         )
@@ -165,151 +157,142 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
         return result
 
 
+# keep everything related to autograd here
 @implements(
     torch.Tensor.register_hook,
-    torch.Tensor.__hash__,
-    torch.Tensor.__array__,
-    torch.Tensor.type,
     torch.Tensor.requires_grad.__get__,
     torch.Tensor.grad.__set__,
     torch.Tensor.grad.__get__,
     torch.Tensor.is_leaf.__get__,
     torch.Tensor.grad_fn.__get__,
-    torch.Tensor.dtype.__get__,
     torch.Tensor.backward,
-    torch.Tensor.is_floating_point,
-    torch.Tensor.device.__get__,
-    torch.Tensor.is_sparse.__get__,  # Pretend to be dense to prevent complaints from PyTorch
-    torch.Tensor.is_complex,
-    torch.Tensor.element_size,
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
 
 
-@implements(torch.Tensor.to)
-def sparse_torch_tensor_to(
-    base_impl,
-    func,
-    types,
-    self,
-    device=None,
-    dtype=None,
-    non_blocking=False,
-    copy=False,
-    memory_format=torch.preserve_format,
-):
-    if (
-        (dtype is not None)
-        or non_blocking
-        or copy
-        or (memory_format != torch.preserve_format)
-    ):
-        raise Exception("Not implemented")
-    wrapper = SparseTensorWrapper(
-        self.wrapped_tensor.to(device),
-        self.requires_grad,
-        self.grad_fmt,
-        dtype=None,
-        device=device,
-    )
-    return wrapper
-
-
-# @implements(torch.Tensor.detach)
-# def sparse_copying_impl(base_impl, func, types, *args, **kwargs):
-#     copied_tensor = base_impl(func, types, args, kwargs)
-#     assert isinstance(copied_tensor, SparseTensorWrapper) and not hasattr(
-#         copied_tensor, "wrapped_tensor"
-#     )
-#     original_tensor = args[0]
-#     assert isinstance(original_tensor, SparseTensorWrapper) and hasattr(
-#         original_tensor, "wrapped_tensor"
-#     )
-#     copied_tensor.wrapped_tensor = original_tensor.wrapped_tensor
-#     return copied_tensor
-
-
-# @implements(
-#     torch.Tensor.shape.__get__,
-#     torch.Tensor.data.__get__,
-# )
-# def sparse_redirection_property_impl(base_impl, func, types, *args, **kwargs):
-#     [original_tensor] = args
-#     result = getattr(original_tensor.wrapped_tensor, func.__self__.__name__)
-#     if isinstance(result, type(original_tensor.wrapped_tensor)):
-#         return SparseTensorWrapper(
-#             result,
-#             original_tensor.requires_grad,
-#             original_tensor.grad_fmt,
-#             dtype=original_tensor.dtype,
-#             device=original_tensor.device,
-#         )
-#     return result
-
 # +++++++++++++++++++++++ fallback implementations +++++++++++++++++++++++
 
-# case 1
-@implements(
-    torch.mm,
-    torch.nn.functional.dropout,
-    torch.nn.functional.linear,
-    torch.Tensor.clone,
-)
-def sparse_functional_fallback(base_impl, func, types, *args, **kwargs):
-    """
-    This fallback works for functions that DO NOT MODIFY inputs and return NEW tensors
-    """
-    op = sparsified_op(
-        func,
-        [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)],
-        [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)],
-    )
-    return op(*args, **kwargs)
+
+def apply_recurse(op, arg):
+    if type(arg) in (list, tuple):
+        return type(arg)(apply_recurse(op, x) for x in arg)
+    if type(arg) == dict:
+        return {k: apply_recurse(op, v) for k, v in arg.items()}
+    else:
+        return op(arg)
 
 
-# case 2
-@implements(
-    torch.Tensor.detach,
-)
-def sparse_reference_fallback(base_impl, func, types, *args, **kwargs):
-    """
-    This fallback works for functions that DO NOT MODIFY inputs and return tensors that SHARE something with inputs
-    """
-    copied_tensor = base_impl(func, types, args, kwargs)
-    assert isinstance(copied_tensor, SparseTensorWrapper) and not hasattr(
-        copied_tensor, "wrapped_tensor"
-    )
-    original_tensor = args[0]
-    assert isinstance(original_tensor, SparseTensorWrapper) and hasattr(
-        original_tensor, "wrapped_tensor"
-    )
-    copied_tensor.wrapped_tensor = original_tensor.wrapped_tensor
-    return copied_tensor
+def apply_cond(cond_action, arg):
+    for c, a in cond_action:
+        if c(arg):
+            return a(arg)
+    return arg
 
 
-# case 3
-@implements(
-    torch.Tensor.shape.__get__,
-)
-def sparse_read_only_fallback(base_impl, func, types, *args, **kwargs):
-    """
-    This fallback works for functions that DO NOT MODIFY inputs and DO NOT OUTPUT any tensors
-    """
-    d_args, d_kwargs = densify_params(args, kwargs)
-    return func(*d_args, *d_kwargs)
+def rand_as_args(arg):
+    def cond(a):
+        return apply_cond(
+            [
+                (
+                    lambda x: isinstance(x, SparseTensorWrapper),
+                    lambda x: torch.randn_like(x.wrapped_tensor.to_dense()),
+                ),
+                (lambda x: isinstance(x, torch.Tensor), lambda x: torch.randn_like(x)),
+            ],
+            a,
+        )
+
+    return apply_recurse(cond, arg)
 
 
-# case 4
-@implements(torch.Tensor.copy_)
-def torch_modify_inplace_fallback(base_impl, func, types, *args, **kwargs):
-    """
-    This fallback works for functions that MODIFY inputs and DO NOT OUTPUT any tensors.
-    """
-    d_args, d_kwargs = densify_params(args, kwargs)
-    output = func(*d_args, **d_kwargs)
-    resparsify_params(args, kwargs, d_args, d_kwargs)
-    return output
+def clone_all(arg):
+    def cond(a):
+        return apply_cond(
+            [
+                (
+                    lambda x: isinstance(x, SparseTensorWrapper),
+                    lambda x: x.clone().detach(),
+                )
+            ],
+            a,
+        )
+    return apply_recurse(cond, arg)
+
+
+def flattened_tensors(args):
+    flat_tensors = []
+    def flatten_tensors(a):
+        if isinstance(a, torch.Tensor):
+            flat_tensors.append(a)
+    apply_recurse(flatten_tensors, args)
+    return flat_tensors
+
+
+def check_op_semantics(op, args, kwargs):    
+    dargs = rand_as_args(args)
+    dkwargs = rand_as_args(kwargs)
+
+    flat_inputs = flattened_tensors(dargs) + flattened_tensors(dkwargs)
+    
+    copied_inputs = [t.clone().detach() for t in flat_inputs]
+
+    output = op(*dargs, **dkwargs)
+    
+    flat_outputs = flattened_tensors(output)
+
+    is_input_modified = any([torch.any(t != r) for t, r in zip(flat_inputs, copied_inputs)])
+    
+    reference_ids = {}
+    
+    copied_outputs = [t.clone().detach() for t in flat_outputs]
+    for i, t in enumerate(flat_inputs):
+        t *= 2
+        t += 1
+        for j, (o, r) in enumerate(zip(flat_outputs, copied_outputs)):
+            if torch.any(o != r) and j not in reference_ids:
+                # input affects output
+                if torch.any(o != t):
+                    raise NotImplementedError("Input affects output but they do not share the same data?")
+                reference_ids[i] = j
+    
+    return is_input_modified, reference_ids, len(flat_inputs), len(flat_outputs)
+
+
+def sparse_fallback(base_impl, func, types, *args, **kwargs):
+    op_modifies_input, op_in_out_mapping, num_inp_tensors, num_out_tensors = check_op_semantics(func, args, kwargs)
+    
+    #_log.debug(f"Creating sparse_fallback for {torch.overrides.resolve_name(func)}")
+    
+    if (op_in_out_mapping == {0: 0}) and op_modifies_input and (num_out_tensors == 1):
+        # inplace operator that returns self (e.g. torch.Tensor.add_, torch.Tensor.copy_)
+        d_args, d_kwargs = densify_params(args, kwargs)
+        d_output = func(*d_args, **d_kwargs)
+        resparsify_params(args, kwargs, d_args, d_kwargs)
+        output = flattened_tensors(args) + flattened_tensors(kwargs)
+        return output[0]
+    elif (op_in_out_mapping == {0: 0}) and (not op_modifies_input):
+        # return self without modification (e.g. torch.Tensor.detach)
+        d_args, d_kwargs = densify_params(args, kwargs)
+        d_output = func(*d_args, **d_kwargs)
+        output = flattened_tensors(args) + flattened_tensors(kwargs)
+        return output[0] 
+    elif (not op_in_out_mapping) and (num_out_tensors == 0) and (not op_modifies_input):
+        # access some attributes of tensor (e.g. torch.Tensor.size)
+        d_args, d_kwargs = densify_params(args, kwargs)
+        return func(*d_args, **d_kwargs)
+    elif (not op_in_out_mapping) and (not op_modifies_input) and (num_out_tensors > 0):
+        # functional operator with backprop
+        op = sparsified_op(
+            func,
+            [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor) for _ in range(num_out_tensors)],
+            [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor) for _ in range(num_out_tensors)],
+        )
+        return op(*args, **kwargs)
+    else:
+        raise NotImplementedError(
+            f"Can't create fallback implementation for {torch.overrides.resolve_name(func)}"
+        )
 
 
 # ======================= fallback implementations =======================
@@ -323,38 +306,14 @@ def resparsify_params(args, kwargs, changed_args, changed_kwargs):
             )
             sparse_arg = sparsifier(SameFormatSparsifier(arg), changed_arg)
             arg.init_from_other(sparse_arg)
-            return arg.wrapped_tensor.to_dense()
-        if isinstance(arg, list):
-            return [resparsify(x) for x in arg]
-        if isinstance(arg, dict):
-            return {k: resparsify(v) for k, v in arg.items()}
-        else:
-            return arg
-
-    for a, ca in zip(args, changed_args):
-        resparsify(a, ca)
-    for k, v in kwargs.items():
-        resparsify(v, changed_kwargs[k])
-
-
-@implements(
-    torch.Tensor.size,
-    torch.Tensor.numel,
-    torch.norm,
-    torch.Tensor.zero_,
-    torch.Tensor.__reduce_ex__,
-    torch.Tensor.reshape,
-)
-def sparse_redirection_function_impl(base_impl, func, types, *args, **kwargs):
-    original_tensor = args[0]
-    result = getattr(original_tensor.wrapped_tensor, func.__name__)(
-        *(args[1:]), **kwargs
-    )
-    if isinstance(result, type(original_tensor.wrapped_tensor)):
-        return SparseTensorWrapper(
-            result, original_tensor.requires_grad, original_tensor.grad_fmt
-        )
-    return result
+        elif isinstance(arg, (list, tuple)):
+            for x, cx in zip(arg, changed_arg):
+                resparsify(x, cx)
+        elif isinstance(arg, dict):
+            for x, cx in zip(arg.values(), changed_arg.values()):
+                resparsify(x, cx)
+    resparsify(args, changed_args)
+    resparsify(kwargs, changed_kwargs)
 
 
 @implements(torch.Tensor.requires_grad_, torch.Tensor.requires_grad.__set__)
@@ -364,116 +323,22 @@ def torch_tensor_requires_grad_(base_impl, func, types, self, requries_grad=True
     return res
 
 
-# @implements(torch.Tensor.copy_)
-# def torch_tensor_copy_(base_impl, func, types, self, src, non_blocking=False):
-#     if get_format(self) == torch.Tensor:  # sparse to dense
-#         self.copy_(src.wrapped_tensor.to_dense())
-#     elif get_format(src) == torch.Tensor:  # dense to sparse
-#         self.wrapped_tensor = self.wrapped_tensor.clone_format(src)
-#     else:  # sparse to sparse
-#         converter = get_sparsifier_implementation(
-#             KeepAll, get_format(src), get_format(self)
-#         )
-#         dst = converter(KeepAll(), src)
-#         self.wrapped_tensor = dst.wrapped_tensor
-
-
-@implements(torch.Tensor.add_)
-def torch_tensor_add_(base_impl, func, types, self, other, *, alpha=1):
-    if get_format(self) == torch.Tensor:  # sparse to dense
-        self.add_(other.wrapped_tensor.to_dense().to(device=other.device), alpha=alpha)
-    elif get_format(other) == torch.Tensor:  # dense to sparse
-        self.wrapped_tensor.add_(other, alpha=alpha)
-    else:  # sparse to sparse
-        self.wrapped_tensor.add_(other.wrapped_tensor.to_dense(), alpha=alpha)
-
-
-@implements(torch.Tensor.mul_)
-def torch_tensor_mul_(base_impl, func, types, self, other):
-    if get_format(self) == torch.Tensor:  # sparse to dense
-        self.mul_(other.wrapped_tensor.to_dense())
-    elif get_format(other) in (torch.Tensor, None):  # dense to sparse
-        self.wrapped_tensor.mul_(other)
-    else:  # sparse to sparse
-        raise Exception("Not implemented")
-
-
-@implements(torch.Tensor.addcmul_)
-def torch_tensor_mul_(base_impl, func, types, self, tensor1, tensor2, *, value=1):
-    if get_format(self) == torch.Tensor:  # any to dense
-        d1, d2 = tensor1, tensor2
-        if hasattr(d1, "wrapped_tensor"):
-            d1 = d1.wrapped_tensor.to_dense().to(device=d1.device)
-        if hasattr(d2, "wrapped_tensor"):
-            d2 = d2.wrapped_tensor.to_dense().to(device=d1.device)
-        self.addcmul_(d1, d2, value=value)
-    elif (
-        get_format(tensor1) == torch.Tensor and get_format(tensor2) == torch.Tensor
-    ):  # dense to sparse
-        self.wrapped_tensor.addcmul_(tensor1, tensor2, value=value)
-    else:  # sparse to sparse
-        raise Exception("Not implemented")
-
-
-@implements(torch.Tensor.addcdiv_)
-def torch_tensor_mul_(base_impl, func, types, self, tensor1, tensor2, *, value=1):
-    if get_format(self) == torch.Tensor:  # any to dense
-        d1, d2 = tensor1, tensor2
-        if hasattr(d1, "wrapped_tensor"):
-            d1 = d1.wrapped_tensor.to_dense()
-        if hasattr(d2, "wrapped_tensor"):
-            d2 = d2.wrapped_tensor.to_dense()
-        self.addcdiv_(d1, d2, value=value)
-    elif (
-        get_format(tensor1) == torch.Tensor and get_format(tensor2) == torch.Tensor
-    ):  # dense to sparse
-        self.wrapped_tensor.addcdiv_(tensor1, tensor2, value=value)
-    else:  # sparse to sparse
-        raise Exception("Not implemented")
-
-
-@implements(torch._has_compatible_shallow_copy_type)
-def torch__has_compatible_shallow_copy_type(base_impl, func, types, *args, **kwargs):
-    return False
+def densify(arg):
+    if isinstance(arg, SparseTensorWrapper):
+        return arg.wrapped_tensor.to_dense()
+    if isinstance(arg, list):
+        return [densify(x) for x in arg]
+    if isinstance(arg, dict):
+        return {k: densify(v) for k, v in arg.items()}
+    else:
+        return arg
 
 
 def densify_params(args, kwargs):
-    def densify(arg):
-        if isinstance(arg, SparseTensorWrapper):
-            return arg.wrapped_tensor.to_dense()
-        if isinstance(arg, list):
-            return [densify(x) for x in arg]
-        if isinstance(arg, dict):
-            return {k: densify(v) for k, v in arg.items()}
-        else:
-            return arg
-
     dense_args = tuple(densify(a) for a in args)
     dense_kwargs = {k: densify(v) for k, v in kwargs.items()}
 
     return dense_args, dense_kwargs
-
-
-@implements(
-    torch.allclose,
-    torch.Tensor.__repr__,
-    torch._C._nn.flatten_dense_tensors,
-    torch._C._nn.unflatten_dense_tensors,
-)
-def sparse_autoconvert_impl(base_impl, func, types, *args, **kwargs):
-    dense_args, dense_kwargs = densify_params(args, kwargs)
-    output = func(*dense_args, **dense_kwargs)
-    return output
-
-
-@implements(torch.zeros_like)
-def sparse_torch_zeros_like(base_impl, func, types, *args, **kwargs):
-    [tensor] = args
-    if "memory_format" in kwargs:
-        del kwargs["memory_format"]
-    if "device" not in kwargs:
-        kwargs["device"] = tensor.device
-    return torch.zeros(tensor.shape, **kwargs)
 
 
 ##################
@@ -692,9 +557,6 @@ class SparsityBuilder:
             return sparse_module
 
 
-# TODO: clean the code above
-
-
 def get_format(tensor):
     if hasattr(tensor, "wrapped_tensor"):
         return tensor.wrapped_tensor.__class__
@@ -738,12 +600,15 @@ def get_sparsifier_implementation(sparsifier, inp, out):
     nothing_to_do = (sparsifier == KeepAll) and (inp == out)
     if not_a_tensor or nothing_to_do:
         return lambda sp, ten: ten
+    
+    if (sparsifier == KeepAll or sparsifier == SameFormatSparsifier) and (inp == torch.Tensor) and (out == DenseTensor):
+        return lambda sp, ten: SparseTensorWrapper.wrapped_from_dense(DenseTensor(ten.clone().detach()), ten)
     # general case
     impl = SPARSIFIER_IMPLEMENTATIONS.get((sparsifier, inp, out))
     if impl is None:
         err_msg = f"Sparsifier implementation is not registered. sparsifier: {sparsifier} inp: {inp} out: {out}."
         if DISPATCH_FAILURE == DISPATCH_WARN and inp != torch.Tensor:
-            logging.warning(
+            _log.warning(
                 f"{err_msg} Use fallback implementation. {sparsifier} inp: {torch.Tensor} out: {out}"
             )
             # we can try to use fallback implementation input_format1 -> torch.Tensor -> sparsifier -> input_format2
@@ -776,8 +641,6 @@ def register_fwd_op_impl(operator, inp, out):
 def pretty_name(obj):
     if isinstance(obj, (list, tuple)):
         return type(obj)([pretty_name(o) for o in obj])
-    if hasattr(obj, "__module__") and hasattr(obj, "__qualname__"):
-        return f"{obj.__module__}.{obj.__qualname__}"
     return str(obj)
 
 
@@ -797,35 +660,6 @@ def check_dense_outputs(out):
     return True
 
 
-# def withDenseTensor(func):
-#     def autoConvertDenseTensor(*args, **kwargs):
-#         cargs = []
-#         for a in args:
-#             if isinstance(a, DenseTensor):
-#                 cargs.append(a.to_dense())
-#             else:
-#                 cargs.append(a)
-#         ckwargs = {}
-#         for k, a in kwargs:
-#             if isinstance(a, DenseTensor):
-#                 ckwargs[k] = a.to_dense()
-#             else:
-#                 ckwargs[k] = a
-#         output = func(*cargs, **ckwargs)
-#         outputs = canonicalize_tensor_tuple(outputs)
-#         coutputs = []
-#         for a in outputs:
-#             if isinstance(a, DenseTensor):
-#                 coutputs.append(a.to_dense())
-#             else:
-#                 coutputs.append(a)
-#         if output != outputs:
-#             coutputs = simplify_tensor_tuple(coutputs)
-#         return coutputs
-
-#     return autoConvertDenseTensor
-
-
 def get_fwd_op_impl(operator, inp, out):
     impl = FWD_OP_IMPLS.get((operator, tuple(inp), tuple(out)))
     if impl is None:
@@ -833,7 +667,7 @@ def get_fwd_op_impl(operator, inp, out):
         out_str = pretty_name(out)
         err_msg = (
             f"Sparse operator implementation is not registered (fwd).\n"
-            f"op: {pretty_name(operator)}\n"
+            f"op: {torch.overrides.resolve_name(operator)}\n"
             f"inp: {inp_str}\n"
             f"out: {out_str}."
         )
@@ -1021,7 +855,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
             )
 
             if not trivially_dense:
-                logging.warning(f"{e}\nFallback to dense implementation.")
+                _log.warning(f"{e}\nFallback to dense implementation.")
                 if DISPATCH_FAILURE == DISPATCH_RAISE:
                     raise e
 
@@ -1048,10 +882,10 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                     raise e
                 else:
                     if fwd_impl_fallback:
-                        logging.warning(f"{e}\nFallback to dense implementation.")
+                        _log.warning(f"{e}\nFallback to dense implementation.")
                         ctx.op_impl_bwd = create_fallback_bwd_impl(grad_inp_fmt1)
                     else:
-                        logging.warning(
+                        _log.warning(
                             f"{e}\nCan't fallback to dense backward implementation because custom forward implementation was used. Attempt to compute backward will raise an exception."
                         )
                         ctx.op_impl_bwd = create_failing_bwd_impl(e)
@@ -1365,11 +1199,11 @@ def sparse_torch_nn_functional_linear_fwd_impl(ctx, inputs, output_sparsifiers):
 
 @register_fwd_op_impl(
     operator=torch.nn.functional.gelu,
-    inp=[torch.Tensor],
+    inp=(torch.Tensor, None),
     out=[(RandomFractionSparsifier, CooTensor)],
 )
 def sparse_torch_nn_functional_gelu_fwd_impl(ctx, inputs, output_sparsifiers):
-    [input] = inputs
+    [input, _] = inputs
     [sparsifier] = output_sparsifiers
     ctx.save_for_backward(input)
     output = torch.nn.functional.gelu(input)
@@ -1450,8 +1284,8 @@ def sparse_torch_nn_functional_linear_bwd_impl(ctx, grad_outputs, input_sparsifi
 @register_bwd_op_impl(
     operator=torch.nn.functional.gelu,
     grad_out=[DenseTensor],
-    grad_inp=[(KeepAll, torch.Tensor)],
-    inp=[torch.Tensor],
+    grad_inp=[(KeepAll, torch.Tensor), None],
+    inp=(torch.Tensor, None),
 )
 def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     [input] = ctx.saved_tensors
@@ -1461,7 +1295,7 @@ def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifier
         0.5 * (1 + torch.erf(2 ** (-0.5) * input))
         + input * torch.exp(-(input**2) / 2) * (2 * torch.pi) ** (-0.5)
     )
-    return grad_input
+    return grad_input, None
 
 
 @register_bwd_op_impl(
