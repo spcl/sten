@@ -2,7 +2,6 @@ import torch
 import sten
 import numpy as np
 import scipy, scipy.sparse
-import logging
 
 
 def test_simple_graph():
@@ -430,7 +429,6 @@ def test_fallback_implementations():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
     test_simple_graph()
     test_modify_transformer_encoder_layer()
     test_build_mlp_from_scratch()

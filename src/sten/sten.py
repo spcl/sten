@@ -1,4 +1,5 @@
 from curses import KEY_PPAGE
+from operator import index
 import torch
 import copy
 import numpy as np
@@ -6,8 +7,7 @@ import torch.fx
 import inspect
 import scipy, scipy.sparse
 import logging
-import itertools
-
+import copy
 
 
 _log = logging.getLogger(__name__)
@@ -94,6 +94,16 @@ class SparseTensorWrapper(torch.Tensor):
         tensor.grad_fmt = grad_fmt
         return tensor
 
+    def __copy__(self):
+        # shallow copy
+        return SparseTensorWrapper(
+            self.wrapped_tensor,
+            self.requires_grad,
+            self.grad_fmt,
+            self.dtype,
+            self.device,
+        )
+
     def init_from_other(self, other):
         assert isinstance(other, SparseTensorWrapper)
         self.wrapped_tensor = other.wrapped_tensor
@@ -171,6 +181,15 @@ def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
 
 
+# takes care of autograd, we have to implement it manually
+@implements(torch.Tensor.detach)
+def sparse_default_impl(base_impl, func, types, *args, **kwargs):
+    # return reference to existing data in new tensor (e.g. torch.Tensor.detach)
+    [inp] = flattened_tensors(args) + flattened_tensors(kwargs)
+    # make shallow copy and disable gradient computation
+    return copy.copy(inp).requires_grad_(False)
+
+
 # +++++++++++++++++++++++ fallback implementations +++++++++++++++++++++++
 
 
@@ -217,76 +236,93 @@ def clone_all(arg):
             ],
             a,
         )
+
     return apply_recurse(cond, arg)
 
 
 def flattened_tensors(args):
     flat_tensors = []
+
     def flatten_tensors(a):
         if isinstance(a, torch.Tensor):
             flat_tensors.append(a)
+
     apply_recurse(flatten_tensors, args)
     return flat_tensors
 
 
-def check_op_semantics(op, args, kwargs):    
+def check_op_semantics(op, args, kwargs):
     dargs = rand_as_args(args)
     dkwargs = rand_as_args(kwargs)
 
     flat_inputs = flattened_tensors(dargs) + flattened_tensors(dkwargs)
-    
+
     copied_inputs = [t.clone().detach() for t in flat_inputs]
 
     output = op(*dargs, **dkwargs)
-    
+
     flat_outputs = flattened_tensors(output)
 
-    is_input_modified = any([torch.any(t != r) for t, r in zip(flat_inputs, copied_inputs)])
-    
-    reference_ids = {}
-    
-    copied_outputs = [t.clone().detach() for t in flat_outputs]
-    for i, t in enumerate(flat_inputs):
-        t *= 2
-        t += 1
-        for j, (o, r) in enumerate(zip(flat_outputs, copied_outputs)):
-            if torch.any(o != r) and j not in reference_ids:
-                # input affects output
-                if torch.any(o != t):
-                    raise NotImplementedError("Input affects output but they do not share the same data?")
-                reference_ids[i] = j
-    
-    return is_input_modified, reference_ids, len(flat_inputs), len(flat_outputs)
+    same_tensor = {}
+    same_data = {}
+    for inp_idx, inp in enumerate(flat_inputs):
+        for out_idx, out in enumerate(flat_outputs):
+            if id(inp) == id(out):
+                same_tensor[inp_idx] = out_idx
+            if inp.data_ptr() == out.data_ptr():
+                same_data[inp_idx] = out_idx
+
+    inplace_changes = []
+    for idx, (t, r) in enumerate(zip(flat_inputs, copied_inputs)):
+        if torch.any(t != r):
+            inplace_changes.append(idx)
+
+    num_inputs = len(flat_inputs)
+    num_outputs = len(flat_outputs)
+
+    return (
+        same_tensor,
+        same_data,
+        inplace_changes,
+        num_inputs,
+        num_outputs,
+    )
 
 
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
-    op_modifies_input, op_in_out_mapping, num_inp_tensors, num_out_tensors = check_op_semantics(func, args, kwargs)
-    
-    #_log.debug(f"Creating sparse_fallback for {torch.overrides.resolve_name(func)}")
-    
-    if (op_in_out_mapping == {0: 0}) and op_modifies_input and (num_out_tensors == 1):
+    (
+        same_tensor,
+        same_data,
+        inplace_changes,
+        num_inputs,
+        num_outputs,
+    ) = check_op_semantics(func, args, kwargs)
+
+    if (same_tensor == {0: 0}) and (inplace_changes == [0]) and (num_outputs == 1):
         # inplace operator that returns self (e.g. torch.Tensor.add_, torch.Tensor.copy_)
-        d_args, d_kwargs = densify_params(args, kwargs)
+        d_args = densify(args)
+        d_kwargs = densify(kwargs)
         d_output = func(*d_args, **d_kwargs)
         resparsify_params(args, kwargs, d_args, d_kwargs)
         output = flattened_tensors(args) + flattened_tensors(kwargs)
         return output[0]
-    elif (op_in_out_mapping == {0: 0}) and (not op_modifies_input):
-        # return self without modification (e.g. torch.Tensor.detach)
-        d_args, d_kwargs = densify_params(args, kwargs)
-        d_output = func(*d_args, **d_kwargs)
-        output = flattened_tensors(args) + flattened_tensors(kwargs)
-        return output[0] 
-    elif (not op_in_out_mapping) and (num_out_tensors == 0) and (not op_modifies_input):
+    elif (not inplace_changes) and (num_outputs == 0):
         # access some attributes of tensor (e.g. torch.Tensor.size)
-        d_args, d_kwargs = densify_params(args, kwargs)
+        d_args = densify(args)
+        d_kwargs = densify(kwargs)
         return func(*d_args, **d_kwargs)
-    elif (not op_in_out_mapping) and (not op_modifies_input) and (num_out_tensors > 0):
+    elif (not same_data) and (not inplace_changes) and (num_outputs > 0):
         # functional operator with backprop
         op = sparsified_op(
             func,
-            [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor) for _ in range(num_out_tensors)],
-            [(KeepAll(), torch.Tensor, KeepAll(), torch.Tensor) for _ in range(num_out_tensors)],
+            [
+                (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
+                for _ in range(num_outputs)
+            ],
+            [
+                (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
+                for _ in range(num_outputs)
+            ],
         )
         return op(*args, **kwargs)
     else:
@@ -312,6 +348,7 @@ def resparsify_params(args, kwargs, changed_args, changed_kwargs):
         elif isinstance(arg, dict):
             for x, cx in zip(arg.values(), changed_arg.values()):
                 resparsify(x, cx)
+
     resparsify(args, changed_args)
     resparsify(kwargs, changed_kwargs)
 
@@ -326,7 +363,7 @@ def torch_tensor_requires_grad_(base_impl, func, types, self, requries_grad=True
 def densify(arg):
     if isinstance(arg, SparseTensorWrapper):
         return arg.wrapped_tensor.to_dense()
-    if isinstance(arg, list):
+    if isinstance(arg, (list, tuple)):
         return [densify(x) for x in arg]
     if isinstance(arg, dict):
         return {k: densify(v) for k, v in arg.items()}
@@ -334,11 +371,34 @@ def densify(arg):
         return arg
 
 
-def densify_params(args, kwargs):
-    dense_args = tuple(densify(a) for a in args)
-    dense_kwargs = {k: densify(v) for k, v in kwargs.items()}
+def densify(args):
+    def cond(a):
+        return apply_cond(
+            [
+                (
+                    lambda x: isinstance(x, SparseTensorWrapper),
+                    lambda x: x.wrapped_tensor.to_dense().detach(),
+                )
+            ],
+            a,
+        )
 
-    return dense_args, dense_kwargs
+    return apply_recurse(cond, args)
+
+
+def recurse_detach_and_enable_grad(args):
+    def cond(a):
+        return apply_cond(
+            [
+                (
+                    lambda x: isinstance(x, torch.Tensor),
+                    lambda x: x.detach().requires_grad_(True),
+                )
+            ],
+            a,
+        )
+
+    return apply_recurse(cond, args)
 
 
 ##################
@@ -600,9 +660,15 @@ def get_sparsifier_implementation(sparsifier, inp, out):
     nothing_to_do = (sparsifier == KeepAll) and (inp == out)
     if not_a_tensor or nothing_to_do:
         return lambda sp, ten: ten
-    
-    if (sparsifier == KeepAll or sparsifier == SameFormatSparsifier) and (inp == torch.Tensor) and (out == DenseTensor):
-        return lambda sp, ten: SparseTensorWrapper.wrapped_from_dense(DenseTensor(ten.clone().detach()), ten)
+
+    if (
+        (sparsifier == KeepAll or sparsifier == SameFormatSparsifier)
+        and (inp == torch.Tensor)
+        and (out == DenseTensor)
+    ):
+        return lambda sp, ten: SparseTensorWrapper.wrapped_from_dense(
+            DenseTensor(ten.clone().detach()), ten
+        )
     # general case
     impl = SPARSIFIER_IMPLEMENTATIONS.get((sparsifier, inp, out))
     if impl is None:
@@ -742,25 +808,22 @@ def collapse_none_tuples(tuple_list):
 
 def create_fallback_fwd_impl(out_fmts):
     def fallback_fwd_impl(ctx, inputs, output_sparsifiers):
-        fallback_inputs, _ = densify_params(inputs, {})
-        fallback_inputs = tuple(
-            (inp.detach() if isinstance(inp, torch.Tensor) else inp)
-            for inp in fallback_inputs
+        fallback_inputs = recurse_detach_and_enable_grad(densify(inputs))
+        unflatten_fallback_inputs = unflatten_list_of_tensors_in_args(fallback_inputs)
+        args_dict = (
+            get_func_signature(ctx.orig_op).bind(*unflatten_fallback_inputs).arguments
         )
-        for inp in fallback_inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.requires_grad_()
-        args_dict = get_func_signature(ctx.orig_op).bind(*fallback_inputs).arguments
         with torch.enable_grad():
             fallback_outputs = ctx.orig_op(**args_dict)
-        indexed_input_tensors = tuple(
-            (i, inp)
+        indexed_input_tensors = {
+            i: inp
             for i, inp in enumerate(fallback_inputs)
             if isinstance(inp, torch.Tensor)
-        )
+        }
         ctx.num_fwd_inputs = len(fallback_inputs)
-        ctx.input_tensor_indices, input_tensors = zip(*indexed_input_tensors)
+        ctx.input_tensor_indices, input_tensors = zip(*indexed_input_tensors.items())
         fallback_outputs = canonicalize_tensor_tuple(fallback_outputs)
+        ctx.num_fwd_input_tensors = len(input_tensors)
         ctx.save_for_backward(*input_tensors, *fallback_outputs)
         outputs = []
         for out_fmt, out_sp, out in zip(out_fmts, output_sparsifiers, fallback_outputs):
@@ -779,9 +842,10 @@ def create_fallback_fwd_impl(out_fmts):
 
 def create_fallback_bwd_impl(grad_inp_fmts):
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
-        fallback_grad_outputs, _ = densify_params(grad_outputs, {})
-        *fallback_inputs, fallback_output = ctx.saved_tensors
-        fallback_output.backward(fallback_grad_outputs)
+        fallback_grad_outputs = densify(grad_outputs)
+        fallback_inputs = ctx.saved_tensors[: ctx.num_fwd_input_tensors]
+        fallback_outputs = ctx.saved_tensors[ctx.num_fwd_input_tensors :]
+        torch.autograd.backward(fallback_outputs, grad_tensors=fallback_grad_outputs)
         fallback_grad_inputs_with_none = [None for _ in range(ctx.num_fwd_inputs)]
         fallback_grad_inputs = tuple(inp.grad for inp in fallback_inputs)
         for i, grad_inp in zip(ctx.input_tensor_indices, fallback_grad_inputs):
@@ -918,6 +982,42 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         return (None, None, None, *grad_inputs)
 
 
+def flatten_list_of_tensors_in_args(args):
+    # turns lists of tensors in arguments to functions like torch.stack into flat lists of arguments
+    output = []
+    for a in args:
+        if isinstance(a, (list, tuple)):
+            nested_tensors = [isinstance(t, torch.Tensor) for t in a]
+            if any(nested_tensors):
+                # nested tensor list (e.g. torch.stack argument)
+                if not all(nested_tensors):
+                    raise NotImplementedError(
+                        "Unexpected: list of tensors contains non-tensor"
+                    )
+                output.append("nested_list_start")
+                output += a
+                output.append("nested_list_end")
+        else:
+            output.append(a)
+    return output
+
+
+def unflatten_list_of_tensors_in_args(args):
+    output = []
+    it = iter(args)
+    for a in it:
+        if a == "nested_list_start":
+            nested_list = []
+            a = next(it)
+            while a != "nested_list_end":
+                nested_list.append(a)
+                a = next(it)
+            output.append(nested_list)
+        else:
+            output.append(a)
+    return output
+
+
 def sparsified_op(orig_op, out_fmt, grad_out_fmt):
     out_fmt = tuple(out_fmt)
     grad_out_fmt = tuple(grad_out_fmt)
@@ -930,8 +1030,7 @@ def sparsified_op(orig_op, out_fmt, grad_out_fmt):
         bound_args = func_sign.bind(*args, **kwargs)
         bound_args.apply_defaults()
         # arguments in the order of definition
-        flat_args = bound_args.arguments.values()
-
+        flat_args = flatten_list_of_tensors_in_args(bound_args.arguments.values())
         outputs = SparseOperatorDispatcher.apply(
             orig_op, out_fmt, grad_out_fmt, *flat_args
         )
