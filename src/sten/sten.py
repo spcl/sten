@@ -1,4 +1,3 @@
-from curses import KEY_PPAGE
 from operator import index
 import torch
 import copy
@@ -86,7 +85,7 @@ class SparseTensorWrapper(torch.Tensor):
         assert not isinstance(wrapped_tensor, SparseTensorWrapper)
         tensor = torch.Tensor._make_subclass(
             cls,
-            torch.tensor([987654321.123456789], dtype=dtype, device=device),
+            torch.tensor([987654321], dtype=dtype, device=device),
             requires_grad,
         )
         tensor.wrapped_tensor = wrapped_tensor
@@ -171,6 +170,7 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
 @implements(
     torch.Tensor.register_hook,
     torch.Tensor.requires_grad.__get__,
+    torch.Tensor._backward_hooks.__set__,
     torch.Tensor.grad.__set__,
     torch.Tensor.grad.__get__,
     torch.Tensor.is_leaf.__get__,
@@ -181,13 +181,25 @@ def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
 
 
-# takes care of autograd, we have to implement it manually
-@implements(torch.Tensor.detach)
-def sparse_default_impl(base_impl, func, types, *args, **kwargs):
-    # return reference to existing data in new tensor (e.g. torch.Tensor.detach)
-    [inp] = flattened_tensors(args) + flattened_tensors(kwargs)
-    # make shallow copy and disable gradient computation
-    return copy.copy(inp).requires_grad_(False)
+def sparse_rebuilder(type, wrapped_tensor, requires_grad, grad_fmt, dtype, device):
+    return type(wrapped_tensor, requires_grad, grad_fmt, dtype, device)
+
+
+@implements(torch.Tensor.__reduce_ex__)
+def sparse_tensor__reduce_ex__(base_impl, func, types, self, proto):
+    # implement serialization for custom classes
+    if isinstance(self, SparseTensorWrapper):
+        args = (
+            type(self),
+            self.wrapped_tensor,
+            self.requires_grad,
+            self.grad_fmt,
+            self.dtype,
+            self.device,
+        )
+        return (sparse_rebuilder, args)
+    else:
+        raise NotImplementedError("This should not happen.")
 
 
 # +++++++++++++++++++++++ fallback implementations +++++++++++++++++++++++
@@ -215,9 +227,14 @@ def rand_as_args(arg):
             [
                 (
                     lambda x: isinstance(x, SparseTensorWrapper),
-                    lambda x: torch.randn_like(x.wrapped_tensor.to_dense()),
+                    lambda x: torch.randn_like(
+                        x.wrapped_tensor.to_dense(), requires_grad=x.requires_grad
+                    ),
                 ),
-                (lambda x: isinstance(x, torch.Tensor), lambda x: torch.randn_like(x)),
+                (
+                    lambda x: isinstance(x, torch.Tensor),
+                    lambda x: torch.randn_like(x, requires_grad=x.requires_grad),
+                ),
             ],
             a,
         )
@@ -290,6 +307,10 @@ def check_op_semantics(op, args, kwargs):
 
 
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
+    _log.warning(
+        f"Making fallback implementation implementation: {torch.overrides.resolve_name(func)}"
+    )
+
     (
         same_tensor,
         same_data,
@@ -306,7 +327,7 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
         resparsify_params(args, kwargs, d_args, d_kwargs)
         output = flattened_tensors(args) + flattened_tensors(kwargs)
         return output[0]
-    elif (not inplace_changes) and (num_outputs == 0):
+    elif (not inplace_changes) and (num_outputs == 0) and (func.__name__ != "__set__"):
         # access some attributes of tensor (e.g. torch.Tensor.size)
         d_args = densify(args)
         d_kwargs = densify(kwargs)
@@ -325,6 +346,15 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
             ],
         )
         return op(*args, **kwargs)
+    elif (
+        (not same_tensor)
+        and (same_data == {0: 0})
+        and (not inplace_changes)
+        and (num_outputs == 1)
+    ):
+        # creates new tensor that shares data with existing (e.g. torch.data.__get__, torch.Tensor.detach)
+        [inp] = flattened_tensors(args) + flattened_tensors(kwargs)
+        return copy.copy(inp).requires_grad_(False)
     else:
         raise NotImplementedError(
             f"Can't create fallback implementation for {torch.overrides.resolve_name(func)}"
@@ -415,7 +445,8 @@ class DenseTensor:
 
 # no-op sparsifier
 class KeepAll:
-    pass
+    def __eq__(self, other):
+        return type(other) == type(self)
 
 
 class SameFormatSparsifier:
@@ -1018,30 +1049,41 @@ def unflatten_list_of_tensors_in_args(args):
     return output
 
 
+class SparseOp:
+    def __init__(self, orig_op, out_fmt, grad_out_fmt):
+        self.orig_op = orig_op
+        self.out_fmt = out_fmt
+        self.grad_out_fmt = grad_out_fmt
+
+    def __call__(self, *args, **kwargs):
+        # here we want to linearize kwargs using the signature of original function
+        func_sign = get_func_signature(self.orig_op)
+        bound_args = func_sign.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+        # arguments in the order of definition
+        flat_args = flatten_list_of_tensors_in_args(bound_args.arguments.values())
+        outputs = SparseOperatorDispatcher.apply(
+            self.orig_op, self.out_fmt, self.grad_out_fmt, *flat_args
+        )
+        outputs = canonicalize_tensor_tuple(outputs)
+        for out, grad_fmt in zip(outputs, self.grad_out_fmt):
+            if isinstance(out, SparseTensorWrapper):
+                out.grad_fmt = grad_fmt
+        outputs = simplify_tensor_tuple(outputs)
+        return outputs
+
+
 def sparsified_op(orig_op, out_fmt, grad_out_fmt):
     out_fmt = tuple(out_fmt)
     grad_out_fmt = tuple(grad_out_fmt)
 
     out_fmt = expand_none_tuples(out_fmt, 4)
 
-    def sparse_op(*args, **kwargs):
-        # here we want to linearize kwargs using the signature of original function
-        func_sign = get_func_signature(orig_op)
-        bound_args = func_sign.bind(*args, **kwargs)
-        bound_args.apply_defaults()
-        # arguments in the order of definition
-        flat_args = flatten_list_of_tensors_in_args(bound_args.arguments.values())
-        outputs = SparseOperatorDispatcher.apply(
-            orig_op, out_fmt, grad_out_fmt, *flat_args
-        )
-        outputs = canonicalize_tensor_tuple(outputs)
-        for out, grad_fmt in zip(outputs, grad_out_fmt):
-            if isinstance(out, SparseTensorWrapper):
-                out.grad_fmt = grad_fmt
-        outputs = simplify_tensor_tuple(outputs)
-        return outputs
+    def wrapper(*args, **kwargs):
+        op = SparseOp(orig_op, out_fmt, grad_out_fmt)
+        return op(*args, **kwargs)
 
-    return sparse_op
+    return wrapper
 
 
 # ====================== Core implementation ======================
@@ -1084,6 +1126,9 @@ class CscTensor:
 class RandomFractionSparsifier:
     def __init__(self, fraction):
         self.fraction = fraction
+
+    def __eq__(self, other):
+        return type(self) == type(other) and self.fraction == other.fraction
 
 
 def random_mask_sparsify(tensor, frac):
