@@ -95,13 +95,45 @@ class SparseTensorWrapper(torch.Tensor):
 
     def __copy__(self):
         # shallow copy
-        return SparseTensorWrapper(
+        return sparse_tensor_builder(
+            type(self),
             self.wrapped_tensor,
             self.requires_grad,
             self.grad_fmt,
             self.dtype,
             self.device,
         )
+        
+    def __deepcopy__(self, memo):
+        if id(self) in memo:
+            return memo[id(self)]
+        else:
+            result = sparse_tensor_builder(
+                type(self),
+                copy.deepcopy(self.wrapped_tensor),
+                copy.deepcopy(self.requires_grad),
+                copy.deepcopy(self.grad_fmt),
+                copy.deepcopy(self.dtype),
+                copy.deepcopy(self.device),
+            )
+            memo[id(self)] = result
+            return result
+        
+    def __reduce_ex__(self, proto):
+        # implement serialization for custom classes
+        if isinstance(self, SparseTensorWrapper):
+            args = (
+                type(self),
+                self.wrapped_tensor,
+                self.requires_grad,
+                self.grad_fmt,
+                self.dtype,
+                self.device,
+            )
+            return (sparse_tensor_builder, args)
+        else:
+            raise NotImplementedError("This should not happen.")
+            
 
     def init_from_other(self, other):
         assert isinstance(other, SparseTensorWrapper)
@@ -166,7 +198,7 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
         return result
 
 
-# keep everything related to autograd here
+# keep everything related to metadata here
 @implements(
     torch.Tensor.register_hook,
     torch.Tensor.requires_grad.__get__,
@@ -176,31 +208,36 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     torch.Tensor.is_leaf.__get__,
     torch.Tensor.grad_fn.__get__,
     torch.Tensor.backward,
+    torch.Tensor.dtype.__get__,
+    torch.Tensor.device.__get__,
+    torch.Tensor.__hash__,  # returns id(self) by default
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
 
 
-def sparse_rebuilder(type, wrapped_tensor, requires_grad, grad_fmt, dtype, device):
-    return type(wrapped_tensor, requires_grad, grad_fmt, dtype, device)
+# creates new tensor that shares data with existing (e.g. torch.Tensor.data.__get__, torch.Tensor.detach)
+@implements(
+    torch.Tensor.data.__get__, torch.Tensor.detach
+)
+def make_new_tensor_with_data_sharing(base_impl, func, types, *args, **kwargs):
+    [inp] = flattened_tensors(args) + flattened_tensors(kwargs)
+    return copy.copy(inp).requires_grad_(False)
+
+
+def sparse_tensor_builder(wrapper_type, wrapped_tensor, requires_grad, grad_fmt, dtype, device):
+    assert issubclass(wrapper_type, SparseTensorWrapper)
+    result = SparseTensorWrapper(wrapped_tensor, requires_grad, grad_fmt, dtype, device)
+    if wrapper_type == SparseParameterWrapper:
+        result = SparseParameterWrapper(result)
+    return result
 
 
 @implements(torch.Tensor.__reduce_ex__)
 def sparse_tensor__reduce_ex__(base_impl, func, types, self, proto):
     # implement serialization for custom classes
-    if isinstance(self, SparseTensorWrapper):
-        args = (
-            type(self),
-            self.wrapped_tensor,
-            self.requires_grad,
-            self.grad_fmt,
-            self.dtype,
-            self.device,
-        )
-        return (sparse_rebuilder, args)
-    else:
-        raise NotImplementedError("This should not happen.")
-
+    raise NotImplementedError("Why it is not redirected automatically?")
+    
 
 # +++++++++++++++++++++++ fallback implementations +++++++++++++++++++++++
 
@@ -308,7 +345,7 @@ def check_op_semantics(op, args, kwargs):
 
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
     _log.warning(
-        f"Making fallback implementation implementation: {torch.overrides.resolve_name(func)}"
+        f"Making fallback implementation: {torch.overrides.resolve_name(func)}"
     )
 
     (
@@ -353,8 +390,10 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
         and (num_outputs == 1)
     ):
         # creates new tensor that shares data with existing (e.g. torch.data.__get__, torch.Tensor.detach)
-        [inp] = flattened_tensors(args) + flattened_tensors(kwargs)
-        return copy.copy(inp).requires_grad_(False)
+        raise NotImplementedError(
+            f"Probably {torch.overrides.resolve_name(func)} function should be dispatched in {make_new_tensor_with_data_sharing.__name__}. "
+            "It is not added explicitly to prevent potential bugs."
+        )
     else:
         raise NotImplementedError(
             f"Can't create fallback implementation for {torch.overrides.resolve_name(func)}"
@@ -390,24 +429,13 @@ def torch_tensor_requires_grad_(base_impl, func, types, self, requries_grad=True
     return res
 
 
-def densify(arg):
-    if isinstance(arg, SparseTensorWrapper):
-        return arg.wrapped_tensor.to_dense()
-    if isinstance(arg, (list, tuple)):
-        return [densify(x) for x in arg]
-    if isinstance(arg, dict):
-        return {k: densify(v) for k, v in arg.items()}
-    else:
-        return arg
-
-
 def densify(args):
     def cond(a):
         return apply_cond(
             [
                 (
                     lambda x: isinstance(x, SparseTensorWrapper),
-                    lambda x: x.wrapped_tensor.to_dense().detach(),
+                    lambda x: x.wrapped_tensor.to_dense(),
                 )
             ],
             a,
