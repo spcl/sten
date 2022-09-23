@@ -265,12 +265,12 @@ def rand_as_args(arg):
                 (
                     lambda x: isinstance(x, SparseTensorWrapper),
                     lambda x: torch.randn_like(
-                        x.wrapped_tensor.to_dense(), requires_grad=x.requires_grad
+                        x.wrapped_tensor.to_dense()
                     ),
                 ),
                 (
                     lambda x: isinstance(x, torch.Tensor),
-                    lambda x: torch.randn_like(x, requires_grad=x.requires_grad),
+                    lambda x: torch.randn_like(x),
                 ),
             ],
             a,
@@ -305,7 +305,15 @@ def flattened_tensors(args):
     return flat_tensors
 
 
+OP_SEMANTICS_CACHE = {}
 def check_op_semantics(op, args, kwargs):
+    if op in OP_SEMANTICS_CACHE:
+        return OP_SEMANTICS_CACHE[op]
+    
+    _log.warning(
+        f"Semantics of {torch.overrides.resolve_name(op)} is unknown, trying to discover it by executing..."
+    )
+
     dargs = rand_as_args(args)
     dkwargs = rand_as_args(kwargs)
 
@@ -334,19 +342,20 @@ def check_op_semantics(op, args, kwargs):
     num_inputs = len(flat_inputs)
     num_outputs = len(flat_outputs)
 
-    return (
+    result = (
         same_tensor,
         same_data,
         inplace_changes,
         num_inputs,
         num_outputs,
     )
+    OP_SEMANTICS_CACHE[op] = result
+
+    return result
 
 
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
-    _log.warning(
-        f"Making fallback implementation: {torch.overrides.resolve_name(func)}"
-    )
+    
 
     (
         same_tensor,
@@ -357,6 +366,9 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
     ) = check_op_semantics(func, args, kwargs)
 
     if (same_tensor == {0: 0}) and (inplace_changes == [0]) and (num_outputs == 1):
+        _log.warning(
+            f"Using fallback dense implementation for inplace operation: {torch.overrides.resolve_name(func)}"
+        )
         # inplace operator that returns self (e.g. torch.Tensor.add_, torch.Tensor.copy_)
         d_args = densify(args)
         d_kwargs = densify(kwargs)
@@ -365,6 +377,9 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
         output = flattened_tensors(args) + flattened_tensors(kwargs)
         return output[0]
     elif (not inplace_changes) and (num_outputs == 0) and (func.__name__ != "__set__"):
+        _log.warning(
+            f"Using fallback dense implementation for attribute access: {torch.overrides.resolve_name(func)}"
+        )
         # access some attributes of tensor (e.g. torch.Tensor.size)
         d_args = densify(args)
         d_kwargs = densify(kwargs)
