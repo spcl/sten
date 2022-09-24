@@ -114,6 +114,46 @@ def test_stack():
         assert torch.allclose(dt.grad, st.grad)
 
 
+def test__hash__():
+    s = set()
+
+    dx = torch.tensor([1.0, 2.0])
+    sx = [
+        SparseTensorWrapper.wrapped_from_dense(
+            DenseTensor(dx.clone().detach()),
+            dx,
+        )
+        for _ in range(3)
+    ]
+
+    s.add(sx[1])
+    s.add(sx[2])
+    s.add(sx[0])
+    s.add(sx[1])
+    assert len(s) == 3
+
+
+def test__eq__():
+    dx = [
+        torch.tensor([1.0, 2.0]),
+        torch.tensor([3.0, 2.0]),
+    ]
+    sx = [
+        SparseTensorWrapper.wrapped_from_dense(
+            DenseTensor(x.clone().detach()),
+            x,
+        )
+        for x in dx
+    ]
+
+    dd = dx[0] == dx[1]
+    sd1 = dx[0] == sx[1]
+    sd2 = sx[0] == dx[1]
+
+    assert torch.equal(sd1, dd)
+    assert torch.equal(sd2, dd)
+
+
 if __name__ == "__main__":
     test_add()
     test_add_()
@@ -121,3 +161,5 @@ if __name__ == "__main__":
     test_detach()
     test_std_mean()
     test_stack()
+    test__hash__()
+    test__eq__()

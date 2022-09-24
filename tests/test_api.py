@@ -244,16 +244,6 @@ class MyCscTensor:
         return torch.from_numpy(self.data.todense())
 
 
-@sten.register_fwd_op_impl(
-    operator=torch.add,
-    inp=(torch.Tensor, torch.Tensor, None, None),
-    out=tuple([(sten.KeepAll, torch.Tensor)]),
-)
-def sparse_add_fwd_impl(ctx, inputs, output_sparsifiers):
-    input, other, alpha, out = inputs
-    return torch.add(input, other, alpha=alpha, out=out)
-
-
 @sten.register_sparsifier_implementation(
     sparsifer=MyRandomFractionSparsifier, inp=torch.Tensor, out=MyCscTensor
 )
@@ -299,18 +289,17 @@ def torch_mm_bwd_impl(ctx, grad_outputs, input_sparsifiers):
 
 @sten.register_bwd_op_impl(
     operator=torch.add,
-    grad_out=(MyCscTensor,),
+    grad_out=[MyCscTensor],
     grad_inp=(
         (sten.KeepAll, torch.Tensor),
         (sten.KeepAll, torch.Tensor),
-        None,
     ),
-    inp=(torch.Tensor, torch.Tensor, None),
+    inp=(torch.Tensor, torch.Tensor),
 )
 def torch_add_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     [grad_output] = grad_outputs
     dense_output = torch.from_numpy(grad_output.wrapped_tensor.data.todense())
-    return dense_output.clone().detach(), dense_output.clone().detach(), None, None
+    return dense_output.clone().detach(), dense_output.clone().detach()
 
 
 class MyRandomFractionSparsifierFallback:
