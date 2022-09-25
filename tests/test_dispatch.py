@@ -1,4 +1,4 @@
-from sten import SparseTensorWrapper, DenseTensor
+from sten import SparseTensorWrapper, SparseParameterWrapper, DenseTensor
 import torch
 
 
@@ -154,6 +154,55 @@ def test__eq__():
     assert torch.equal(sd2, dd)
 
 
+def test__repr__():
+    x = torch.tensor([1.0, 2.0])
+    sx = SparseTensorWrapper.wrapped_from_dense(
+        DenseTensor(x.clone().detach()),
+        x,
+    )
+    assert "SparseTensorWrapper" in repr(sx)
+
+    px = SparseParameterWrapper(sx)
+    rpx = repr(px)
+    assert "SparseTensorWrapper" in rpx and "SparseParameterWrapper" in rpx
+
+
+class MyDenseTensor:
+    def __init__(self, data):
+        self.data = data
+
+    @property
+    def ndim(self):
+        return "ndim_ok"
+
+    def size(self):
+        return "size_ok"
+
+    @property
+    def shape(self):
+        return "shape_ok"
+
+
+def test_sizes():
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    sx = SparseTensorWrapper.wrapped_from_dense(
+        DenseTensor(x.clone().detach()),
+        x,
+    )
+    msx = SparseTensorWrapper.wrapped_from_dense(
+        MyDenseTensor(x.clone().detach()),
+        x,
+    )
+
+    assert sx.ndim == x.ndim
+    assert sx.size() == x.size()
+    assert sx.shape == x.shape
+
+    assert msx.ndim == "ndim_ok"
+    assert msx.size() == "size_ok"
+    assert msx.shape == "shape_ok"
+
+
 if __name__ == "__main__":
     test_add()
     test_add_()
@@ -163,3 +212,5 @@ if __name__ == "__main__":
     test_stack()
     test__hash__()
     test__eq__()
+    test__repr__()
+    test_sizes()

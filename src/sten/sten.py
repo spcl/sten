@@ -7,6 +7,7 @@ import inspect
 import scipy, scipy.sparse
 import logging
 import copy
+import types
 
 
 _log = logging.getLogger(__name__)
@@ -143,9 +144,7 @@ class SparseTensorWrapper(torch.Tensor):
             raise Exception("This should never happen.")
 
     def __repr__(self):
-        return (
-            f"SparseTensorWrapper ({type(self.wrapped_tensor)}):\n" + super().__repr__()
-        )
+        return f"SparseTensorWrapper:\n" f"{self.wrapped_tensor}"
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -220,6 +219,41 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
+
+
+def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
+    (
+        same_tensor,
+        same_data,
+        inplace_changes,
+        num_inputs,
+        num_outputs,
+    ) = check_op_semantics(func, args, kwargs)
+
+    if num_inputs == 1:
+        [self] = [
+            x
+            for x in list(args) + list(kwargs.values())
+            if isinstance(x, SparseTensorWrapper)
+        ]
+        if func.__name__ == "__get__":
+            # attribute access, try to redirect to wrapped tensor (e.g. ten.shape)
+            attribute_name = func.__self__.__name__
+            if hasattr(self.wrapped_tensor, attribute_name):
+                return getattr(self.wrapped_tensor, attribute_name)
+        elif isinstance(func, types.MethodDescriptorType):
+            # call method of a class (e.g. ten.size())
+            method_name = func.__name__
+            wrapper_class = type(self.wrapped_tensor)
+            if hasattr(wrapper_class, method_name):
+                return getattr(wrapper_class, method_name)(*args, **kwargs)
+
+    _log.warning(
+        f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}"
+    )
+    d_args = densify(args)
+    d_kwargs = densify(kwargs)
+    return func(*d_args, **d_kwargs)
 
 
 # creates new tensor that shares data with existing (e.g. torch.Tensor.data.__get__, torch.Tensor.detach)
@@ -382,13 +416,8 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
         output = flattened_tensors(args) + flattened_tensors(kwargs)
         return output[0]
     elif (not inplace_changes) and (num_outputs == 0) and (func.__name__ != "__set__"):
-        _log.warning(
-            f"Using fallback dense implementation for attribute access: {torch.overrides.resolve_name(func)}"
-        )
         # access some attributes of tensor (e.g. torch.Tensor.size)
-        d_args = densify(args)
-        d_kwargs = densify(kwargs)
-        return func(*d_args, **d_kwargs)
+        return sparse_redirect_impl(base_impl, func, types, *args, **kwargs)
     elif (not same_data) and (not inplace_changes) and (num_outputs > 0):
         # functional operator with backprop
         op = sparsified_op(
