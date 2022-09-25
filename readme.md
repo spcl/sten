@@ -27,7 +27,7 @@ python tests/test_api.py
 ## Installation
 
 ```
-pip install git+https://github.com/spcl/sten.git
+pip install sten
 ```
 
 ## Code organization

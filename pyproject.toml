@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sten"
-version = "0.0.1"
+version = "0.0.2"
+description = "STen: An Interface for Efficient Sparsity in PyTorch"
 dependencies = [
     "torch",
     "numpy",
@@ -25,3 +26,7 @@ dependencies = [
     "pytest-cov",
     "pytest-xdist",
 ]
+
+[project.urls]
+"Homepage" = "https://github.com/spcl/sten"
+"Bug Tracker" = "https://github.com/spcl/sten/issues"
