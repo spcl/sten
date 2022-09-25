@@ -8,6 +8,7 @@ import scipy, scipy.sparse
 import logging
 import copy
 import types
+import random
 
 
 _log = logging.getLogger(__name__)
@@ -82,11 +83,20 @@ class SparseTensorWrapper(torch.Tensor):
         grad_fmt,
         dtype,
         device,
+        *,
+        dummy_shape=None,
     ):
         assert not isinstance(wrapped_tensor, SparseTensorWrapper)
+
+        # we randomly initialize tensor to help finding bugs with the incorrect use of tensor data
+        if dummy_shape is None:
+            dummy_shape = [random.randint(1, 3) for _ in range(random.randint(1, 3))]
+
+        dummy = torch.randint(7770, 7779, dummy_shape, dtype=dtype, device=device)
+
         tensor = torch.Tensor._make_subclass(
             cls,
-            torch.tensor([987654321], dtype=dtype, device=device),
+            dummy,
             requires_grad,
         )
         tensor.wrapped_tensor = wrapped_tensor
@@ -212,13 +222,46 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     torch.Tensor.grad.__get__,
     torch.Tensor.is_leaf.__get__,
     torch.Tensor.grad_fn.__get__,
-    torch.Tensor.backward,
     torch.Tensor.dtype.__get__,
     torch.Tensor.device.__get__,
     torch.Tensor.__hash__,  # returns id(self) by default
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
+
+
+def get_dummy_shape(tensor):
+    assert isinstance(tensor, SparseTensorWrapper)
+    # ugly hack to use base class dummy implementation
+    old_class = tensor.__class__
+    tensor.__class__ = torch.Tensor
+    dummy_shape = tensor.shape
+    tensor.__class__ = old_class
+    return dummy_shape
+
+
+@implements(
+    torch.Tensor.backward,
+)
+def sparse_backward_impl(base_impl, func, types, *args, **kwargs):
+    # here we try to match dummy shape of gradient to the shape of self before continuing
+    self = args[0]
+    grad = args[1] if len(args) > 1 else kwargs["gradient"]
+    match_grad = SparseTensorWrapper(
+        grad.wrapped_tensor,
+        grad.requires_grad,
+        grad.grad_fmt,
+        grad.dtype,
+        grad.device,
+        dummy_shape=get_dummy_shape(self),
+    )
+    new_args = [a for a in args]
+    if len(new_args) > 1:
+        new_args[1] = match_grad
+    new_kwargs = {k: v for k, v in kwargs.items()}
+    if "gradient" in new_kwargs:
+        new_kwargs["gradient"] = match_grad
+    return base_impl(func, types, new_args, new_kwargs)
 
 
 def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
@@ -1014,6 +1057,13 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                 return (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
             return (None, None, None, None)
 
+        ctx.dummy_input_shapes = []
+        for x in args_kwargs:
+            if isinstance(x, SparseTensorWrapper):
+                ctx.dummy_input_shapes.append(get_dummy_shape(x))
+            else:
+                ctx.dummy_input_shapes.append(None)
+
         inp_fmt = tuple(get_format(a) for a in args_kwargs)
         ctx.grad_inp_fmt = tuple(find_gradient_fmt(a) for a in args_kwargs)
         ctx.disp_state = disp_state
@@ -1110,7 +1160,23 @@ class SparseOperatorDispatcher(torch.autograd.Function):
             get_sparsifier_implementation(s2.__class__, f1, f2)(s2, inp)
             for inp, f1, s2, f2 in zip(tmp_grad_inputs, fmt1, sp2, fmt2)
         )
-        return (None, *grad_inputs)
+        # make shapes of grad_inputs the same as shapes of inputs to avoid complaints from autograd
+        reshaped_grad_inputs = []
+        for x, ds in zip(grad_inputs, ctx.dummy_input_shapes):
+            if isinstance(x, SparseTensorWrapper):
+                rx = SparseTensorWrapper(
+                    wrapped_tensor=x.wrapped_tensor,
+                    requires_grad=x.requires_grad,
+                    grad_fmt=x.grad_fmt,
+                    dtype=x.dtype,
+                    device=x.device,
+                    dummy_shape=ds,
+                )
+                reshaped_grad_inputs.append(rx)
+            else:
+                reshaped_grad_inputs.append(x)
+
+        return (None, *reshaped_grad_inputs)
 
 
 class TensorIdx:
