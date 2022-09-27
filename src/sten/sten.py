@@ -1012,8 +1012,11 @@ def create_fallback_fwd_impl(out_fmts):
 #
 
 
-def create_fallback_bwd_impl(grad_inp_fmts):
+def create_fallback_bwd_impl(grad_inp_fmts, warning=None):
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
+        if warning is not None:
+            _log.warning(warning)
+        
         fallback_grad_outputs = densify(grad_outputs)
         fallback_inputs = ctx.saved_tensors[: ctx.num_fwd_input_tensors]
         fallback_outputs = ctx.saved_tensors[ctx.num_fwd_input_tensors :]
@@ -1041,7 +1044,7 @@ def create_fallback_bwd_impl(grad_inp_fmts):
 
 def create_failing_bwd_impl(exception):
     def failing_bwd_impl(ctx, grad_outputs, input_sparsifiers):
-        raise exception
+        raise DispatchError(exception)
 
     return failing_bwd_impl
 
@@ -1127,13 +1130,17 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                     raise e
                 else:
                     if fwd_impl_fallback:
-                        _log.warning(f"{e}\nFallback to dense implementation.")
-                        ctx.op_impl_bwd = create_fallback_bwd_impl(grad_inp_fmt1)
-                    else:
-                        _log.warning(
-                            f"{e}\nCan't fallback to dense backward implementation because custom forward implementation was used. Attempt to compute backward will raise an exception."
+                        ctx.op_impl_bwd = create_fallback_bwd_impl(
+                            grad_inp_fmt1, 
+                            f"{e}\n"
+                            "Using fallback backward implementation."
                         )
-                        ctx.op_impl_bwd = create_failing_bwd_impl(e)
+                    else:
+                        ctx.op_impl_bwd = create_failing_bwd_impl(
+                            f"{e}\n"
+                            f"Can't use fallback dense backward implementation "
+                            f"because custom forward implementation was used."
+                        )
 
         tmp_outputs = op_impl_fwd(ctx, args_kwargs, sp1)
         tmp_outputs = canonicalize_tensor_tuple(tmp_outputs)
