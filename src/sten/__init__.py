@@ -1,3 +1,3 @@
 from .sten import *
 
-from .patches import *
+from .patches import patch
