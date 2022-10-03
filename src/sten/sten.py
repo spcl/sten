@@ -69,7 +69,7 @@ class SparseTensorWrapper(torch.Tensor):
         if grad_fmt is None:
             grad_fmt = (KeepAll(), torch.Tensor, KeepAll(), DenseTensor)
         return SparseTensorWrapper(
-            wrapped_tensor=wrapped,
+            wrapped_tensor_container=[wrapped],
             requires_grad=dense.requires_grad,
             grad_fmt=grad_fmt,
             dtype=dense.dtype,
@@ -78,7 +78,7 @@ class SparseTensorWrapper(torch.Tensor):
 
     def __new__(
         cls,
-        wrapped_tensor,
+        wrapped_tensor_container,
         requires_grad,
         grad_fmt,
         dtype,
@@ -86,7 +86,7 @@ class SparseTensorWrapper(torch.Tensor):
         *,
         dummy_shape=None,
     ):
-        assert not isinstance(wrapped_tensor, SparseTensorWrapper)
+        assert not isinstance(wrapped_tensor_container[0], SparseTensorWrapper)
 
         # We randomly initialize tensor to help finding bugs with the incorrect use of tensor data.
         # We try to keep different shapes, but the same number of elements to avoid memory bugs that
@@ -101,7 +101,7 @@ class SparseTensorWrapper(torch.Tensor):
             dummy,
             requires_grad,
         )
-        tensor.wrapped_tensor = wrapped_tensor
+        tensor._wrapped_tensor_container = wrapped_tensor_container
         tensor.update_grad_fix_hook()
         tensor.grad_fmt = grad_fmt
         return tensor
@@ -110,7 +110,7 @@ class SparseTensorWrapper(torch.Tensor):
         # shallow copy
         return sparse_tensor_builder(
             type(self),
-            self.wrapped_tensor,
+            self._wrapped_tensor_container,
             self.requires_grad,
             self.grad_fmt,
             self.dtype,
@@ -123,7 +123,7 @@ class SparseTensorWrapper(torch.Tensor):
         else:
             result = sparse_tensor_builder(
                 type(self),
-                copy.deepcopy(self.wrapped_tensor),
+                copy.deepcopy(self._wrapped_tensor_container),
                 copy.deepcopy(self.requires_grad),
                 copy.deepcopy(self.grad_fmt),
                 copy.deepcopy(self.dtype),
@@ -133,7 +133,7 @@ class SparseTensorWrapper(torch.Tensor):
                 assert isinstance(self.grad, SparseTensorWrapper)
                 grad_copy = copy.deepcopy(self.grad)
                 result.grad = SparseTensorWrapper(
-                    grad_copy.wrapped_tensor,
+                    grad_copy.wrapped_tensor_container,
                     grad_copy.requires_grad,
                     grad_copy.grad_fmt,
                     grad_copy.dtype,
@@ -149,7 +149,7 @@ class SparseTensorWrapper(torch.Tensor):
         if isinstance(self, SparseTensorWrapper):
             args = (
                 type(self),
-                self.wrapped_tensor,
+                self._wrapped_tensor_container,
                 self.requires_grad,
                 self.grad_fmt,
                 self.dtype,
@@ -188,6 +188,14 @@ class SparseTensorWrapper(torch.Tensor):
             _log.error(f"Exception raised during handling __torch_function__: {e}")
             # Sometimes this exception is silently ignored by PyTorch.
             raise e
+        
+    @property
+    def wrapped_tensor(self):
+        return self._wrapped_tensor_container[0]
+
+    @wrapped_tensor.setter
+    def wrapped_tensor(self, value):
+        self._wrapped_tensor_container[0] = value
 
 
 class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
@@ -204,7 +212,7 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
         assert isinstance(sparse_tensor_wrapper, SparseTensorWrapper)
         return super().__new__(
             cls,
-            wrapped_tensor=sparse_tensor_wrapper.wrapped_tensor,
+            wrapped_tensor_container=sparse_tensor_wrapper._wrapped_tensor_container,
             requires_grad=sparse_tensor_wrapper.requires_grad,
             grad_fmt=sparse_tensor_wrapper.grad_fmt,
             dtype=sparse_tensor_wrapper.dtype,
@@ -262,7 +270,7 @@ def sparse_backward_impl(base_impl, func, types, *args, **kwargs):
     self = args[0]
     grad = args[1] if len(args) > 1 else kwargs["gradient"]
     match_grad = SparseTensorWrapper(
-        grad.wrapped_tensor,
+        grad._wrapped_tensor_container,
         grad.requires_grad,
         grad.grad_fmt,
         grad.dtype,
@@ -318,10 +326,10 @@ def make_new_tensor_with_data_sharing(base_impl, func, types, *args, **kwargs):
 
 
 def sparse_tensor_builder(
-    wrapper_type, wrapped_tensor, requires_grad, grad_fmt, dtype, device
+    wrapper_type, wrapped_tensor_container, requires_grad, grad_fmt, dtype, device
 ):
     assert issubclass(wrapper_type, SparseTensorWrapper)
-    result = SparseTensorWrapper(wrapped_tensor, requires_grad, grad_fmt, dtype, device)
+    result = SparseTensorWrapper(wrapped_tensor_container, requires_grad, grad_fmt, dtype, device)
     if wrapper_type == SparseParameterWrapper:
         result = SparseParameterWrapper(result)
     return result
@@ -948,8 +956,8 @@ PATCHED_OVERRIDES = {
     torch.stack: lambda tensors, dim=0, *, out=None: -1,
     torch.eq: lambda input, other, *, out=None: -1,
     torch.Tensor.eq: lambda input, other: -1,
+    torch.zeros_like: lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1,
 }
-
 
 def bind_func_signature(original_func, args, kwargs):
     override_dict = torch.overrides.get_testing_overrides()
@@ -1186,7 +1194,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         for x, ds in zip(grad_inputs, ctx.dummy_input_shapes):
             if isinstance(x, SparseTensorWrapper):
                 rx = SparseTensorWrapper(
-                    wrapped_tensor=x.wrapped_tensor,
+                    wrapped_tensor_container=x._wrapped_tensor_container,
                     requires_grad=x.requires_grad,
                     grad_fmt=x.grad_fmt,
                     dtype=x.dtype,
