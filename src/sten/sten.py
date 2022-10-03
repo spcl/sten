@@ -88,10 +88,12 @@ class SparseTensorWrapper(torch.Tensor):
     ):
         assert not isinstance(wrapped_tensor, SparseTensorWrapper)
 
-        # we randomly initialize tensor to help finding bugs with the incorrect use of tensor data
+        # We randomly initialize tensor to help finding bugs with the incorrect use of tensor data.
+        # We try to keep different shapes, but the same number of elements to avoid memory bugs that
+        # may be even harder to catch.
         if dummy_shape is None:
-            dummy_shape = [random.randint(1, 3) for _ in range(random.randint(1, 3))]
-
+            dummy_shape = [1] * random.randint(5, 10) + [2,2,3]
+            random.shuffle(dummy_shape)
         dummy = torch.randint(7770, 7779, dummy_shape, dtype=dtype, device=device)
 
         tensor = torch.Tensor._make_subclass(
@@ -127,6 +129,18 @@ class SparseTensorWrapper(torch.Tensor):
                 copy.deepcopy(self.dtype),
                 copy.deepcopy(self.device),
             )
+            if self.grad is not None:
+                assert isinstance(self.grad, SparseTensorWrapper)
+                grad_copy = copy.deepcopy(self.grad)
+                result.grad = SparseTensorWrapper(
+                    grad_copy.wrapped_tensor,
+                    grad_copy.requires_grad,
+                    grad_copy.grad_fmt,
+                    grad_copy.dtype,
+                    grad_copy.device,
+                    dummy_shape=get_dummy_shape(result),
+                )
+                
             memo[id(self)] = result
             return result
 
@@ -274,11 +288,7 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
     ) = check_op_semantics(func, args, kwargs)
 
     if num_inputs == 1:
-        [self] = [
-            x
-            for x in list(args) + list(kwargs.values())
-            if isinstance(x, SparseTensorWrapper)
-        ]
+        self, *other_args = args
         if func.__name__ == "__get__":
             # attribute access, try to redirect to wrapped tensor (e.g. ten.shape)
             attribute_name = func.__self__.__name__
@@ -288,8 +298,9 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
             # call method of a class (e.g. ten.size())
             method_name = func.__name__
             wrapper_class = type(self.wrapped_tensor)
+            
             if hasattr(wrapper_class, method_name):
-                return getattr(wrapper_class, method_name)(*args, **kwargs)
+                return getattr(wrapper_class, method_name)(self.wrapped_tensor, *other_args, **kwargs)
 
     _log.warning(
         f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}"
@@ -591,24 +602,27 @@ def get_direct_name(fully_qualified_tensor_name):
     return fully_qualified_tensor_name.rsplit(".", 1)[-1]
 
 
+class TracedSubmodules:
+    def __init__(self):
+        self.data = {}
+        
+    def access(self, module, submodule_path):
+        submodule = module
+        tokens = [x for x in submodule_path.split(".") if x]
+        for token in tokens:
+            submodule = getattr(submodule, token)
+        if submodule_path not in self.data:
+            self.data[submodule_path] = torch.fx.symbolic_trace(submodule)
+        return self.data[submodule_path]
+
+
 class SparsityBuilder:
-    def __init__(self, module):
-        self.module = module
-        self.traced_submodules = {}
+    def __init__(self):
         self.initial_weight_sparsifiers = {}
         self.weights = {}
         self.grad_weights = {}
         self.interms = {}
         self.grad_interms = {}
-
-    def traced_submodule(self, submodule_path):
-        submodule = self.module
-        tokens = [x for x in submodule_path.split(".") if x]
-        for token in tokens:
-            submodule = getattr(submodule, token)
-        if submodule_path not in self.traced_submodules:
-            self.traced_submodules[submodule_path] = torch.fx.symbolic_trace(submodule)
-        return self.traced_submodules[submodule_path]
 
     def set_weight(
         self,
@@ -700,8 +714,8 @@ class SparsityBuilder:
                 interm_name, KeepAll(), torch.Tensor, KeepAll(), DenseTensor
             )
 
-    def replace_with_traced_submodules(self, sparse_module):
-        for traced_module in self.traced_submodules.values():
+    def replace_with_traced_submodules(self, sparse_module, traced_submodules):
+        for traced_module in traced_submodules.values():
             traced_module.recompile()
 
         # start replacing submodules from the outermost to innermost
@@ -710,7 +724,7 @@ class SparsityBuilder:
             return len([t for t in path.split(".") if t])
 
         traced_submodules_list = sorted(
-            list(self.traced_submodules.items()), key=num_tokens
+            list(traced_submodules.items()), key=num_tokens
         )
 
         for module_path, traced_module in traced_submodules_list:
@@ -726,17 +740,20 @@ class SparsityBuilder:
 
         return sparse_module
 
-    def get_sparse_model(self):
+    def sparsify_model_inplace(self, module):
         self.fill_remaining()
+        
+        traced_submodules = TracedSubmodules()
+        
         with torch.no_grad():
-            sparse_module = copy.deepcopy(self.module)
+            sparse_module = module
 
             for name, (sp1, fmt1, sp2, fmt2) in self.interms.items():
                 grad_sp1, grad_fmt1, grad_sp2, grad_fmt2 = self.grad_interms[name]
 
                 direct_name = get_direct_name(name)
                 submodule_path = get_module_path(name)
-                submodule = self.traced_submodule(submodule_path)
+                submodule = traced_submodules.access(module, submodule_path)
 
                 [node] = (n for n in submodule.graph.nodes if n.name == direct_name)
                 node.target = sparsified_op(
@@ -745,7 +762,7 @@ class SparsityBuilder:
                     [(grad_sp1, grad_fmt1, grad_sp2, grad_fmt2)],
                 )
 
-            sparse_module = self.replace_with_traced_submodules(sparse_module)
+            sparse_module = self.replace_with_traced_submodules(sparse_module, traced_submodules.data)
 
             # weight modification should happen only after the call to replace_with_traced_submodules
             # otherwise these changes will be lost
@@ -767,6 +784,10 @@ class SparsityBuilder:
                 setattr(direct_module, direct_name, wrapper)
 
             return sparse_module
+        
+    def get_sparse_model(self, module):
+        copied_module = copy.deepcopy(module)
+        return self.sparsify_model_inplace(copied_module)
 
 
 def get_format(tensor):

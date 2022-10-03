@@ -44,9 +44,9 @@ def make_sparse_catcher(orig_fn):
     def sparse_catcher(*args, **kwargs):
         args_with_stubs, flat_args = flatten_list_of_tensors_in_args(args)
         kwargs_with_stubs, flat_kwargs = flatten_list_of_tensors_in_args(kwargs)
-        if flat_args or flat_kwargs:
+        if any(isinstance(t, sten.SparseTensorWrapper) for t in flat_args + flat_kwargs):
             # implementation that will handle args properly
-            #_log.warning(f"Catching {orig_fn.__module__}.{orig_fn.__name__} called with the sparse arguments!")
+            _log.warning(f"Catching {orig_fn.__module__}.{orig_fn.__name__} called with the sparse arguments!")
             flat_d_args = sten.densify(flat_args)
             flat_d_kwargs = sten.densify(flat_kwargs)
             d_args = unflatten_list_of_tensors_in_args(args_with_stubs, flat_d_args)
@@ -79,16 +79,16 @@ def make_sparse_catcher(orig_fn):
 
 # +++++ heuristically try to catch most of pytorch API calls 
 
-for nc, c in inspect.getmembers(torch._C._distributed_c10d, inspect.isclass):
-    for nm, m in inspect.getmembers(c):
-        if callable(m) and not nm.startswith('__'):
-            _log.warning(f"Patching {nc}.{nm}")
-            assert type(m) is not property
-            patch(m, make_sparse_catcher(m))
+# for nc, c in inspect.getmembers(torch._C._distributed_c10d, inspect.isclass):
+#     for nm, m in inspect.getmembers(c):
+#         if callable(m) and not nm.startswith('__'):
+#             _log.warning(f"Patching {nc}.{nm}")
+#             assert type(m) is not property
+#             patch(m, make_sparse_catcher(m))
         
-for nf, f in inspect.getmembers(torch._C._distributed_c10d, inspect.isbuiltin):
-    _log.warning(f"Patching {nf}")
-    patch(f, make_sparse_catcher(f))
+# for nf, f in inspect.getmembers(torch._C._distributed_c10d, inspect.isbuiltin):
+#     _log.warning(f"Patching {nf}")
+#     patch(f, make_sparse_catcher(f))
         
 # for nf, f in inspect.getmembers(torch._C):
 #     if inspect.isbuiltin(f) and nf.startswith('_'):
@@ -96,6 +96,13 @@ for nf, f in inspect.getmembers(torch._C._distributed_c10d, inspect.isbuiltin):
 
 # ===== heuristically try to catch most of pytorch API calls 
 
+# fixes torch DDP
+for x in [
+    torch._C._distributed_c10d._verify_params_across_processes,
+    torch._C._distributed_c10d._broadcast_coalesced,
+    torch._C._distributed_c10d._compute_bucket_assignment_by_size,
+]:
+    patch(x, make_sparse_catcher(x))
 
 if torch.__version__.startswith("1.12"):
     # patch transformer code to remove control flow and make it traceable

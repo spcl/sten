@@ -37,13 +37,13 @@ def test_module_weights_serialization():
     sten.set_dispatch_failure("warn")
 
     model = torch.nn.TransformerEncoderLayer(d_model=512, nhead=8)
-    sb = sten.SparsityBuilder(model)
+    sb = sten.SparsityBuilder()
     sb.set_weight(
         name="linear1.weight",
         initial_sparsifier=sten.ScalarFractionSparsifier(0.5),
         out_format=sten.CooTensor,
     )
-    sparse_model = sb.get_sparse_model()
+    sparse_model = sb.get_sparse_model(model)
     assert isinstance(sparse_model.linear1.weight, sten.SparseParameterWrapper)
     assert isinstance(sparse_model.linear1.weight.wrapped_tensor, sten.CooTensor)
 

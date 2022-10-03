@@ -56,7 +56,7 @@ def test_modify_transformer_encoder_layer():
     sten.set_dispatch_failure("warn")
 
     model = torch.nn.TransformerEncoderLayer(d_model=512, nhead=8)
-    sb = sten.SparsityBuilder(model)
+    sb = sten.SparsityBuilder()
     sb.set_weight(
         name="linear1.weight",
         initial_sparsifier=sten.ScalarFractionSparsifier(0.5),
@@ -67,7 +67,7 @@ def test_modify_transformer_encoder_layer():
         external_sparsifier=sten.ScalarFractionSparsifier(0.5),
         out_format=sten.CooTensor,
     )
-    sparse_model = sb.get_sparse_model()
+    sparse_model = sb.get_sparse_model(model)
     assert isinstance(sparse_model.linear1.weight, sten.SparseParameterWrapper)
     assert isinstance(sparse_model.linear1.weight.wrapped_tensor, sten.CooTensor)
     sparse_model(torch.randn(8, 128, 512))
@@ -190,7 +190,7 @@ def test_modify_bert_encoder():
     input = torch.rand(input_shape, requires_grad=True)
     (output,) = model(input)
 
-    sb = sten.SparsityBuilder(model)
+    sb = sten.SparsityBuilder()
 
     for module_name, module in model.named_modules():
         if isinstance(module, torch.nn.modules.linear.Linear):
@@ -211,7 +211,7 @@ def test_modify_bert_encoder():
         sten.CooTensor,
     )
 
-    sparse_model = sb.get_sparse_model()
+    sparse_model = sb.get_sparse_model(model)
 
     sparse_input = input.clone().detach()
     sparse_input.requires_grad = True
