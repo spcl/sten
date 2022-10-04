@@ -56,8 +56,6 @@ def make_sparse_catcher(orig_fn):
             d_output = orig_fn(*d_args, **d_kwargs)
             out_with_stabs, flat_out = flatten_list_of_tensors_in_args(d_output)
             # check for modifications
-            if f"{orig_fn.__module__}.{orig_fn.__name__}" == 'amp_C.multi_tensor_lamb':
-                print('here')
             for cpy, orig, dense in zip(arg_copies, all_flat_args, all_flat_d_args):
                 if isinstance(orig, SparseTensorWrapper):
                     if torch.allclose(cpy, dense):
