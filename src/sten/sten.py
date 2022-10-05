@@ -1046,11 +1046,8 @@ def create_fallback_fwd_impl(out_fmts):
 #
 
 
-def create_fallback_bwd_impl(grad_inp_fmts, warning=None):
+def create_fallback_bwd_impl(grad_inp_fmts):
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
-        if warning is not None:
-            _log.warning(warning)
-        
         fallback_grad_outputs = densify(grad_outputs)
         fallback_inputs = ctx.saved_tensors[: ctx.num_fwd_input_tensors]
         fallback_outputs = ctx.saved_tensors[ctx.num_fwd_input_tensors :]
