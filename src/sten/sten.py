@@ -243,6 +243,7 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     torch.Tensor.dtype.__get__,
     torch.Tensor.device.__get__,
     torch.Tensor.__hash__,  # returns id(self) by default
+    torch.Tensor.is_sparse.__get__,  # pretend to be dense
 )
 def sparse_default_impl(base_impl, func, types, *args, **kwargs):
     return base_impl(func, types, args, kwargs)
