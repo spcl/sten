@@ -1,7 +1,6 @@
 import torch
 import io
 import sten
-import logging
 import scipy
 
 
@@ -57,6 +56,5 @@ def test_module_weights_serialization():
 
 
 if __name__ == "__main__":
-    logging.basicConfig()
     test_tensor_serialization()
     test_module_weights_serialization()

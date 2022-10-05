@@ -1,17 +1,13 @@
-from operator import index
 import torch
 import copy
 import numpy as np
 import torch.fx
 import inspect
 import scipy, scipy.sparse
-import logging
 import copy
 import types
 import random
-
-
-_log = logging.getLogger(__name__)
+import warnings
 
 
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
@@ -35,7 +31,7 @@ def set_dispatch_failure(action):
 # ====================== Dispatch defaults ======================
 
 
-class DispatchError(Exception):
+class DispatchError(Warning):
     pass
 
 
@@ -185,7 +181,7 @@ class SparseTensorWrapper(torch.Tensor):
         except Exception as e:
             # Keep this error message to have an opportunity to catch the error
             # if exception is not reraised.
-            _log.error(f"Exception raised during handling __torch_function__: {e}")
+            warnings.warn(f"Exception raised during handling __torch_function__: {e}")
             # Sometimes this exception is silently ignored by PyTorch.
             raise e
 
@@ -312,8 +308,8 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
                     self.wrapped_tensor, *other_args, **kwargs
                 )
 
-    _log.warning(
-        f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}"
+    warnings.warn(
+        f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}", DispatchError
     )
     d_args = densify(args)
     d_kwargs = densify(kwargs)
@@ -416,8 +412,9 @@ def check_op_semantics(op, args, kwargs):
     if op in OP_SEMANTICS_CACHE:
         return OP_SEMANTICS_CACHE[op]
 
-    _log.warning(
-        f"Semantics of {torch.overrides.resolve_name(op)} is unknown, trying to discover it by executing..."
+    warnings.warn(
+        f"Semantics of {torch.overrides.resolve_name(op)} is unknown, trying to discover it by executing...",
+        DispatchError
     )
 
     dargs = rand_as_args(args)
@@ -471,8 +468,9 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
     ) = check_op_semantics(func, args, kwargs)
 
     if (same_tensor == {0: 0}) and (inplace_changes == [0]) and (num_outputs == 1):
-        _log.warning(
-            f"Using fallback dense implementation for inplace operation: {torch.overrides.resolve_name(func)}"
+        warnings.warn(
+            f"Using fallback dense implementation for inplace operation: {torch.overrides.resolve_name(func)}",
+            DispatchError,
         )
         # inplace operator that returns self (e.g. torch.Tensor.add_, torch.Tensor.copy_)
         d_args = densify(args)
@@ -859,8 +857,9 @@ def get_sparsifier_implementation(sparsifier, inp, out):
     if impl is None:
         err_msg = f"Sparsifier implementation is not registered. sparsifier: {sparsifier} inp: {inp} out: {out}."
         if DISPATCH_FAILURE == DISPATCH_WARN and inp != torch.Tensor:
-            _log.warning(
-                f"{err_msg} Use fallback implementation. {sparsifier} inp: {torch.Tensor} out: {out}"
+            warnings.warn(
+                f"{err_msg} Use fallback implementation. {sparsifier} inp: {torch.Tensor} out: {out}",
+                DispatchError,
             )
             # we can try to use fallback implementation input_format1 -> torch.Tensor -> sparsifier -> input_format2
             # instead of input_format1 -> sparsifier -> input_format2
@@ -1129,7 +1128,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
             )
 
             if not trivially_dense:
-                _log.warning(f"{e}\nFallback to dense implementation.")
+                warnings.warn(f"{e}\nFallback to dense implementation.", DispatchError)
                 if DISPATCH_FAILURE == DISPATCH_RAISE:
                     raise e
 

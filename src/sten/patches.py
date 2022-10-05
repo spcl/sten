@@ -1,28 +1,38 @@
 import torch
 
-import logging
 import inspect
 import sys
 import copy
 from functools import partial, cache
 
-from sten.sten import SparseTensorWrapper, flatten_list_of_tensors_in_args, unflatten_list_of_tensors_in_args
+from sten import (
+    SparseTensorWrapper,
+    flatten_list_of_tensors_in_args,
+    unflatten_list_of_tensors_in_args,
+)
 import sten
+import warnings
 
-_log = logging.getLogger(__name__)
 
 @cache
 def get_member_funcs(subclass):
-    return [(n, m) for (n, m) in inspect.getmembers(subclass) if (not inspect.isclass(m) and callable(m))]
+    return [
+        (n, m)
+        for (n, m) in inspect.getmembers(subclass)
+        if (not inspect.isclass(m) and callable(m))
+    ]
+
 
 @cache
 def get_mod_classes(module):
     return inspect.getmembers(module, inspect.isclass)
 
+
 def patch_class(old, new, subclass):
     for name, func in get_member_funcs(subclass):
         if func is old:
             setattr(subclass, name, new)
+
 
 def patch_module(old, new, module):
     for name, subclass in get_mod_classes(module):
@@ -31,13 +41,14 @@ def patch_module(old, new, module):
         if func is old:
             setattr(module, name, new)
 
-TORCH_MODULES = [mod for name, mod in sys.modules.items() if name.startswith('torch')]
+
+TORCH_MODULES = [mod for name, mod in sys.modules.items() if name.startswith("torch")]
 
 
 def patch(old, new, module_scope=TORCH_MODULES):
     for mod in module_scope:
         patch_module(old, new, mod)
-        
+
 
 def make_sparse_catcher(orig_fn):
     def sparse_catcher(*args, **kwargs):
@@ -46,13 +57,24 @@ def make_sparse_catcher(orig_fn):
         all_flat_args = flat_args + flat_kwargs
         if any(isinstance(t, sten.SparseTensorWrapper) for t in all_flat_args):
             # implementation that will handle args properly
-            _log.warning(f"Catching {orig_fn.__module__}.{orig_fn.__name__} called with the sparse arguments!")
+            warnings.warn(
+                f"Catching {orig_fn.__module__}.{orig_fn.__name__} called with the sparse arguments!"
+            )
             flat_d_args = sten.densify(flat_args)
             flat_d_kwargs = sten.densify(flat_kwargs)
             all_flat_d_args = flat_d_args + flat_d_kwargs
             d_args = unflatten_list_of_tensors_in_args(args_with_stubs, flat_d_args)
-            d_kwargs = unflatten_list_of_tensors_in_args(kwargs_with_stubs, flat_d_kwargs)
-            arg_copies = [(copy.deepcopy(dense_ten) if isinstance(orig_ten, sten.SparseTensorWrapper) else None) for orig_ten, dense_ten in zip(all_flat_args, all_flat_d_args)]
+            d_kwargs = unflatten_list_of_tensors_in_args(
+                kwargs_with_stubs, flat_d_kwargs
+            )
+            arg_copies = [
+                (
+                    copy.deepcopy(dense_ten)
+                    if isinstance(orig_ten, sten.SparseTensorWrapper)
+                    else None
+                )
+                for orig_ten, dense_ten in zip(all_flat_args, all_flat_d_args)
+            ]
             d_output = orig_fn(*d_args, **d_kwargs)
             out_with_stabs, flat_out = flatten_list_of_tensors_in_args(d_output)
             # check for modifications
@@ -61,7 +83,9 @@ def make_sparse_catcher(orig_fn):
                     if torch.allclose(cpy, dense):
                         continue  # no inplace changes
                     sparsifier = sten.get_sparsifier_implementation(
-                        sten.SameFormatSparsifier, torch.Tensor, orig.wrapped_tensor.__class__
+                        sten.SameFormatSparsifier,
+                        torch.Tensor,
+                        orig.wrapped_tensor.__class__,
                     )
                     # TODO: not sure how to distinguish full replacement and nonzero modification
                     sparse_arg = sparsifier(sten.SameFormatSparsifier(orig), dense)
@@ -87,26 +111,28 @@ def make_sparse_catcher(orig_fn):
         else:
             # default implementation
             return orig_fn(*args, **kwargs)
+
     return sparse_catcher
 
-# +++++ heuristically try to catch most of pytorch API calls 
+
+# +++++ heuristically try to catch most of pytorch API calls
 
 # for nc, c in inspect.getmembers(torch._C._distributed_c10d, inspect.isclass):
 #     for nm, m in inspect.getmembers(c):
 #         if callable(m) and not nm.startswith('__'):
-#             _log.warning(f"Patching {nc}.{nm}")
+#             warnings.warn(f"Patching {nc}.{nm}")
 #             assert type(m) is not property
 #             patch(m, make_sparse_catcher(m))
-        
+
 # for nf, f in inspect.getmembers(torch._C._distributed_c10d, inspect.isbuiltin):
-#     _log.warning(f"Patching {nf}")
+#     warnings.warn(f"Patching {nf}")
 #     patch(f, make_sparse_catcher(f))
-        
+
 # for nf, f in inspect.getmembers(torch._C):
 #     if inspect.isbuiltin(f) and nf.startswith('_'):
 #         patch(f, partial(sparse_catcher, f))
 
-# ===== heuristically try to catch most of pytorch API calls 
+# ===== heuristically try to catch most of pytorch API calls
 
 # fixes torch DDP
 for x in [
