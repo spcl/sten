@@ -13,6 +13,7 @@ from sten import (
 import sten
 import warnings
 
+from sten import DispatchError
 
 @cache
 def get_member_funcs(subclass):
@@ -58,7 +59,8 @@ def make_sparse_catcher(orig_fn):
         if any(isinstance(t, sten.SparseTensorWrapper) for t in all_flat_args):
             # implementation that will handle args properly
             warnings.warn(
-                f"Catching {orig_fn.__module__}.{orig_fn.__name__} called with the sparse arguments!"
+                f"Catching {orig_fn.__module__}.{orig_fn.__name__} called with the sparse arguments!",
+                DispatchError,
             )
             flat_d_args = sten.densify(flat_args)
             flat_d_kwargs = sten.densify(flat_kwargs)
@@ -80,7 +82,7 @@ def make_sparse_catcher(orig_fn):
             # check for modifications
             for cpy, orig, dense in zip(arg_copies, all_flat_args, all_flat_d_args):
                 if isinstance(orig, SparseTensorWrapper):
-                    if torch.allclose(cpy, dense):
+                    if torch.equal(cpy, dense):
                         continue  # no inplace changes
                     sparsifier = sten.get_sparsifier_implementation(
                         sten.SameFormatSparsifier,
@@ -89,11 +91,7 @@ def make_sparse_catcher(orig_fn):
                     )
                     # TODO: not sure how to distinguish full replacement and nonzero modification
                     sparse_arg = sparsifier(sten.SameFormatSparsifier(orig), dense)
-                    orig1 = copy.deepcopy(orig)
-                    assert not torch.allclose(sparse_arg, orig1)
                     orig.init_from_other(sparse_arg)
-                    assert not torch.allclose(orig, orig1)
-                    assert torch.allclose(orig, sparse_arg)
                 else:
                     assert cpy is None
             # return output
