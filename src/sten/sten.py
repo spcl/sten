@@ -92,7 +92,7 @@ class SparseTensorWrapper(torch.Tensor):
         # We try to keep different shapes, but the same number of elements to avoid memory bugs that
         # may be even harder to catch.
         if dummy_shape is None:
-            dummy_shape = [1] * random.randint(5, 10) + [2,2,3]
+            dummy_shape = [1] * random.randint(5, 10) + [2, 2, 3]
             random.shuffle(dummy_shape)
         dummy = torch.randint(7770, 7779, dummy_shape, dtype=dtype, device=device)
 
@@ -140,7 +140,7 @@ class SparseTensorWrapper(torch.Tensor):
                     grad_copy.device,
                     dummy_shape=get_dummy_shape(result),
                 )
-                
+
             memo[id(self)] = result
             return result
 
@@ -188,7 +188,7 @@ class SparseTensorWrapper(torch.Tensor):
             _log.error(f"Exception raised during handling __torch_function__: {e}")
             # Sometimes this exception is silently ignored by PyTorch.
             raise e
-        
+
     @property
     def wrapped_tensor(self):
         return self._wrapped_tensor_container[0]
@@ -306,9 +306,11 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
             # call method of a class (e.g. ten.size())
             method_name = func.__name__
             wrapper_class = type(self.wrapped_tensor)
-            
+
             if hasattr(wrapper_class, method_name):
-                return getattr(wrapper_class, method_name)(self.wrapped_tensor, *other_args, **kwargs)
+                return getattr(wrapper_class, method_name)(
+                    self.wrapped_tensor, *other_args, **kwargs
+                )
 
     _log.warning(
         f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}"
@@ -329,7 +331,9 @@ def sparse_tensor_builder(
     wrapper_type, wrapped_tensor_container, requires_grad, grad_fmt, dtype, device
 ):
     assert issubclass(wrapper_type, SparseTensorWrapper)
-    result = SparseTensorWrapper(wrapped_tensor_container, requires_grad, grad_fmt, dtype, device)
+    result = SparseTensorWrapper(
+        wrapped_tensor_container, requires_grad, grad_fmt, dtype, device
+    )
     if wrapper_type == SparseParameterWrapper:
         result = SparseParameterWrapper(result)
     return result
@@ -613,7 +617,7 @@ def get_direct_name(fully_qualified_tensor_name):
 class TracedSubmodules:
     def __init__(self):
         self.data = {}
-        
+
     def access(self, module, submodule_path):
         submodule = module
         tokens = [x for x in submodule_path.split(".") if x]
@@ -731,9 +735,7 @@ class SparsityBuilder:
             path, module = x
             return len([t for t in path.split(".") if t])
 
-        traced_submodules_list = sorted(
-            list(traced_submodules.items()), key=num_tokens
-        )
+        traced_submodules_list = sorted(list(traced_submodules.items()), key=num_tokens)
 
         for module_path, traced_module in traced_submodules_list:
             if module_path == "":
@@ -750,9 +752,9 @@ class SparsityBuilder:
 
     def sparsify_model_inplace(self, module):
         self.fill_remaining()
-        
+
         traced_submodules = TracedSubmodules()
-        
+
         with torch.no_grad():
             sparse_module = module
 
@@ -770,7 +772,9 @@ class SparsityBuilder:
                     [(grad_sp1, grad_fmt1, grad_sp2, grad_fmt2)],
                 )
 
-            sparse_module = self.replace_with_traced_submodules(sparse_module, traced_submodules.data)
+            sparse_module = self.replace_with_traced_submodules(
+                sparse_module, traced_submodules.data
+            )
 
             # weight modification should happen only after the call to replace_with_traced_submodules
             # otherwise these changes will be lost
@@ -792,7 +796,7 @@ class SparsityBuilder:
                 setattr(direct_module, direct_name, wrapper)
 
             return sparse_module
-        
+
     def get_sparse_model(self, module):
         copied_module = copy.deepcopy(module)
         return self.sparsify_model_inplace(copied_module)
@@ -959,6 +963,7 @@ PATCHED_OVERRIDES = {
     torch.zeros_like: lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1,
 }
 
+
 def bind_func_signature(original_func, args, kwargs):
     override_dict = torch.overrides.get_testing_overrides()
     dummy_func = PATCHED_OVERRIDES.get(original_func, override_dict[original_func])
@@ -1075,54 +1080,51 @@ def create_failing_bwd_impl(exception):
     return failing_bwd_impl
 
 
+def find_gradient_fmt(tensor):
+    if isinstance(tensor, SparseTensorWrapper):
+        assert len(tensor.grad_fmt) == 4
+        return tensor.grad_fmt
+    if isinstance(tensor, torch.Tensor):
+        return (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
+    return (None, None, None, None)
+
+
+def get_dummy_shapes(tensors):
+    dummy_shapes = []
+    for x in tensors:
+        if isinstance(x, SparseTensorWrapper):
+            dummy_shapes.append(get_dummy_shape(x))
+        else:
+            dummy_shapes.append(None)
+    return dummy_shapes
+
+
+def sparsifier_obj_to_classes(sparsifiers, formats):
+    return tuple(
+        ((s.__class__, f) if s is not None else None)
+        for s, f in zip(sparsifiers, formats)
+    )
+
+
 class SparseOperatorDispatcher(torch.autograd.Function):
     @staticmethod
     def forward(ctx, disp_state, *args_kwargs):
-        def find_gradient_fmt(tensor):
-            if isinstance(tensor, SparseTensorWrapper):
-                assert len(tensor.grad_fmt) == 4
-                return tensor.grad_fmt
-            if isinstance(tensor, torch.Tensor):
-                return (KeepAll(), torch.Tensor, KeepAll(), torch.Tensor)
-            return (None, None, None, None)
-
-        ctx.dummy_input_shapes = []
-        for x in args_kwargs:
-            if isinstance(x, SparseTensorWrapper):
-                ctx.dummy_input_shapes.append(get_dummy_shape(x))
-            else:
-                ctx.dummy_input_shapes.append(None)
-
-        inp_fmt = tuple(get_format(a) for a in args_kwargs)
+        ctx.dummy_input_shapes = get_dummy_shapes(args_kwargs)
+        ctx.inp_fmt = tuple(get_format(a) for a in args_kwargs)
         ctx.grad_inp_fmt = tuple(find_gradient_fmt(a) for a in args_kwargs)
         ctx.disp_state = disp_state
-        sp1, fmt1, sp2, fmt2 = tuple(zip(*disp_state.out_fmt))
-        gsp1, gfmt1, gsp2, gfmt2 = tuple(zip(*disp_state.grad_out_fmt))
-        grad_inp_sp1, grad_inp_fmt1, grad_inp_sp2, grad_inp_fmt2 = tuple(
-            zip(*ctx.grad_inp_fmt)
-        )
-        op_out_fmt = tuple(
-            ((s.__class__, f) if s is not None else None) for s, f in zip(sp1, fmt1)
-        )
-        op_gout_fmt = tuple(
-            ((s.__class__, f) if s is not None else None) for s, f in zip(gsp2, gfmt2)
-        )
-        op_ginp_fmt = tuple(
-            ((s.__class__, f) if s is not None else None)
-            for s, f in zip(grad_inp_sp1, grad_inp_fmt1)
-        )
+        out_sp1, out_fmt1, out_sp2, out_fmt2 = zip(*ctx.disp_state.out_fmt)
+        op_out_fmt = sparsifier_obj_to_classes(out_sp1, out_fmt1)
 
         # warning: do not merge following section with try-except block for backward pass,
         # because their trivially_dense property may be different
-
-        fwd_impl_fallback = False
-
+        ctx.fwd_impl_fallback = False
         # find implementation for the forward pass
         try:
-            op_impl_fwd = get_fwd_op_impl(disp_state.orig_op, inp_fmt, op_out_fmt)
+            op_impl_fwd = get_fwd_op_impl(disp_state.orig_op, ctx.inp_fmt, op_out_fmt)
         except DispatchError as e:
             # are all types are trivially reducible to dense?
-            trivially_dense = check_dense_inputs(inp_fmt) and check_dense_outputs(
+            trivially_dense = check_dense_inputs(ctx.inp_fmt) and check_dense_outputs(
                 op_out_fmt
             )
 
@@ -1132,62 +1134,64 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                     raise e
 
             # try to create fallback implementation
+            ctx.fwd_impl_fallback = True
+            op_impl_fwd = create_fallback_fwd_impl(out_fmt1)
 
-            fwd_impl_fallback = True
-            op_impl_fwd = create_fallback_fwd_impl(fmt1)
-
-        # find implementation for the backward pass
-        try:
-            ctx.op_impl_bwd = get_bwd_op_impl(
-                disp_state.orig_op, gfmt2, op_ginp_fmt, inp_fmt
-            )
-        except DispatchError as e:
-            # are all types are trivially reducible to dense?
-            trivially_dense = (
-                check_dense_inputs(gfmt2)
-                and check_dense_outputs(op_ginp_fmt)
-                and check_dense_inputs(inp_fmt)
-            )
-
-            if trivially_dense:
-                ctx.op_impl_bwd = create_fallback_bwd_impl(grad_inp_fmt1)
-            else:
-                if DISPATCH_FAILURE == DISPATCH_RAISE:
-                    raise e
-                else:
-                    if fwd_impl_fallback:
-                        _log.warning(f"{e}\nFallback to dense implementation.")
-                        ctx.op_impl_bwd = create_fallback_bwd_impl(grad_inp_fmt1)
-                    else:
-                        _log.warning(
-                            f"{e}\nCan't fallback to dense backward implementation because custom forward implementation was used. Attempt to compute backward will raise an exception."
-                        )
-                        ctx.op_impl_bwd = create_failing_bwd_impl(e)
-
-        tmp_outputs = op_impl_fwd(ctx, args_kwargs, sp1)
+        tmp_outputs = op_impl_fwd(ctx, args_kwargs, out_sp1)
         tmp_outputs = canonicalize_tensor_tuple(tmp_outputs)
-        check_formats(f"{disp_state.orig_op} (fwd)", tmp_outputs, fmt1)
+        check_formats(f"{disp_state.orig_op} (fwd)", tmp_outputs, out_fmt1)
         assert len(tmp_outputs) == len(disp_state.out_fmt)
         outputs = tuple(
             get_sparsifier_implementation(s2.__class__, f1, f2)(s2, tmp_out)
-            for tmp_out, f1, s2, f2 in zip(tmp_outputs, fmt1, sp2, fmt2)
+            for tmp_out, f1, s2, f2 in zip(tmp_outputs, out_fmt1, out_sp2, out_fmt2)
         )
         outptus = simplify_tensor_tuple(outputs)
         return outptus
 
     @staticmethod
     def backward(ctx, *args):
-        sp1, fmt1, sp2, fmt2 = tuple(zip(*ctx.grad_inp_fmt))
-        grad_out_fmt = tuple(get_format(a) for a in args)
-        op_inp_fmt = tuple(
-            ((s.__class__, f) if s is not None else None) for s, f in zip(sp1, fmt1)
-        )
-        tmp_grad_inputs = ctx.op_impl_bwd(ctx, args, sp1)
+        grad_out_fmt_actual = tuple(get_format(a) for a in args)
+        gout_sp1, gout_fmt1, gout_sp2, gout_fmt2 = zip(*ctx.disp_state.grad_out_fmt)
+
+        if gout_fmt2 != grad_out_fmt_actual:
+            raise ValueError(
+                f"Backward implementation received output gradients of incorrect format. Expected: {ctx.disp_state.grad_out_fmt}. Actual: {grad_out_fmt_actual}."
+            )
+
+        ginp_sp1, ginp_fmt1, ginp_sp2, ginp_fmt2 = zip(*ctx.grad_inp_fmt)
+
+        op_ginp_fmt = sparsifier_obj_to_classes(ginp_sp1, ginp_fmt1)
+
+        # find implementation for the backward pass
+        try:
+            op_impl_bwd = get_bwd_op_impl(
+                ctx.disp_state.orig_op, gout_fmt2, op_ginp_fmt, ctx.inp_fmt
+            )
+        except DispatchError as e:
+            # are all types are trivially reducible to dense?
+            trivially_dense = (
+                check_dense_inputs(gout_fmt2)
+                and check_dense_outputs(op_ginp_fmt)
+                and check_dense_inputs(ctx.inp_fmt)
+            )
+
+            if trivially_dense:
+                op_impl_bwd = create_fallback_bwd_impl(ginp_fmt1)
+            else:
+                if DISPATCH_FAILURE == DISPATCH_RAISE:
+                    raise e
+                else:
+                    if ctx.fwd_impl_fallback:
+                        op_impl_bwd = create_fallback_bwd_impl(ginp_fmt1)
+                    else:
+                        op_impl_bwd = create_failing_bwd_impl(e)
+
+        tmp_grad_inputs = op_impl_bwd(ctx, args, ginp_sp1)
         tmp_grad_inputs = canonicalize_tensor_tuple(tmp_grad_inputs)
-        check_formats(f"{ctx.disp_state.orig_op} (bwd)", tmp_grad_inputs, fmt1)
+        check_formats(f"{ctx.disp_state.orig_op} (bwd)", tmp_grad_inputs, ginp_fmt1)
         grad_inputs = tuple(
             get_sparsifier_implementation(s2.__class__, f1, f2)(s2, inp)
-            for inp, f1, s2, f2 in zip(tmp_grad_inputs, fmt1, sp2, fmt2)
+            for inp, f1, s2, f2 in zip(tmp_grad_inputs, ginp_fmt1, ginp_sp2, ginp_fmt2)
         )
         # make shapes of grad_inputs the same as shapes of inputs to avoid complaints from autograd
         reshaped_grad_inputs = []
