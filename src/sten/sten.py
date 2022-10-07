@@ -68,8 +68,6 @@ class SparseTensorWrapper(torch.Tensor):
             wrapped_tensor_container=[wrapped],
             requires_grad=dense.requires_grad,
             grad_fmt=grad_fmt,
-            dtype=dense.dtype,
-            device=dense.device,
         )
 
     def __new__(
@@ -77,8 +75,6 @@ class SparseTensorWrapper(torch.Tensor):
         wrapped_tensor_container,
         requires_grad,
         grad_fmt,
-        dtype,
-        device,
         *,
         dummy_shape=None,
     ):
@@ -90,6 +86,9 @@ class SparseTensorWrapper(torch.Tensor):
         if dummy_shape is None:
             dummy_shape = [1] * random.randint(5, 10) + [2, 2, 3]
             random.shuffle(dummy_shape)
+        wt = wrapped_tensor_container[0]
+        dtype = wt.dtype if hasattr(wt, 'dtype') else wt.to_dense().dtype
+        device = wt.device if hasattr(wt, 'device') else wt.to_dense().device    
         dummy = torch.randint(7770, 7779, dummy_shape, dtype=dtype, device=device)
 
         tensor = torch.Tensor._make_subclass(
@@ -128,8 +127,6 @@ class SparseTensorWrapper(torch.Tensor):
                     grad_copy.wrapped_tensor_container,
                     grad_copy.requires_grad,
                     grad_copy.grad_fmt,
-                    grad_copy.dtype,
-                    grad_copy.device,
                     dummy_shape=get_dummy_shape(result),
                 )
 
@@ -205,8 +202,6 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
             wrapped_tensor_container=sparse_tensor_wrapper._wrapped_tensor_container,
             requires_grad=sparse_tensor_wrapper.requires_grad,
             grad_fmt=sparse_tensor_wrapper.grad_fmt,
-            dtype=sparse_tensor_wrapper.dtype,
-            device=sparse_tensor_wrapper.device,
         )
 
     def __repr__(self):
@@ -262,8 +257,6 @@ def sparse_backward_impl(base_impl, func, types, *args, **kwargs):
         grad._wrapped_tensor_container,
         grad.requires_grad,
         grad.grad_fmt,
-        grad.dtype,
-        grad.device,
         dummy_shape=get_dummy_shape(self),
     )
     new_args = [a for a in args]
@@ -326,11 +319,8 @@ def sparse_tensor_builder(
     wrapper_type, wrapped_tensor_container, requires_grad, grad_fmt
 ):
     assert issubclass(wrapper_type, SparseTensorWrapper)
-    wt = wrapped_tensor_container[0]
-    dtype = wt.dtype if hasattr(wt, 'dtype') else wt.to_dense().dtype
-    device = wt.device if hasattr(wt, 'device') else wt.to_dense().device
     result = SparseTensorWrapper(
-        wrapped_tensor_container, requires_grad, grad_fmt, dtype, device
+        wrapped_tensor_container, requires_grad, grad_fmt
     )
     if wrapper_type == SparseParameterWrapper:
         result = SparseParameterWrapper(result)
@@ -1202,8 +1192,6 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                     wrapped_tensor_container=x._wrapped_tensor_container,
                     requires_grad=x.requires_grad,
                     grad_fmt=x.grad_fmt,
-                    dtype=x.dtype,
-                    device=x.device,
                     dummy_shape=ds,
                 )
                 reshaped_grad_inputs.append(rx)

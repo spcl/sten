@@ -171,6 +171,9 @@ class MyDenseTensor:
     def __init__(self, data):
         self.data = data
 
+    def to_dense(self):
+        return self.data
+
     @property
     def ndim(self):
         return "ndim_ok"
