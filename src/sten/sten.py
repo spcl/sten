@@ -240,8 +240,6 @@ class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     torch.Tensor.grad.__get__,
     torch.Tensor.is_leaf.__get__,
     torch.Tensor.grad_fn.__get__,
-    torch.Tensor.dtype.__get__,
-    torch.Tensor.device.__get__,
     torch.Tensor.__hash__,  # returns id(self) by default
     torch.Tensor.is_sparse.__get__,  # pretend to be dense
 )
@@ -310,7 +308,8 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
                 )
 
     warnings.warn(
-        f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}", DispatchError
+        f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}",
+        DispatchError,
     )
     d_args = densify(args)
     d_kwargs = densify(kwargs)
@@ -322,6 +321,11 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
 def make_new_tensor_with_data_sharing(base_impl, func, types, *args, **kwargs):
     [inp] = flattened_tensors(args) + flattened_tensors(kwargs)
     return copy.copy(inp).requires_grad_(False)
+
+
+@implements(torch.Tensor.data.__set__)
+def sparse_tensor_data_set(base_impl, func, types, *args, **kwargs):
+    args[0].copy_(args[1])
 
 
 def sparse_tensor_builder(
@@ -415,7 +419,7 @@ def check_op_semantics(op, args, kwargs):
 
     warnings.warn(
         f"Semantics of {torch.overrides.resolve_name(op)} is unknown, trying to discover it by executing...",
-        DispatchError
+        DispatchError,
     )
 
     dargs = rand_as_args(args)
