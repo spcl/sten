@@ -109,8 +109,6 @@ class SparseTensorWrapper(torch.Tensor):
             self._wrapped_tensor_container,
             self.requires_grad,
             self.grad_fmt,
-            self.dtype,
-            self.device,
         )
 
     def __deepcopy__(self, memo):
@@ -122,8 +120,6 @@ class SparseTensorWrapper(torch.Tensor):
                 copy.deepcopy(self._wrapped_tensor_container),
                 copy.deepcopy(self.requires_grad),
                 copy.deepcopy(self.grad_fmt),
-                copy.deepcopy(self.dtype),
-                copy.deepcopy(self.device),
             )
             if self.grad is not None:
                 assert isinstance(self.grad, SparseTensorWrapper)
@@ -148,8 +144,6 @@ class SparseTensorWrapper(torch.Tensor):
                 self._wrapped_tensor_container,
                 self.requires_grad,
                 self.grad_fmt,
-                self.dtype,
-                self.device,
             )
             return (sparse_tensor_builder, args)
         else:
@@ -329,9 +323,12 @@ def sparse_tensor_data_set(base_impl, func, types, *args, **kwargs):
 
 
 def sparse_tensor_builder(
-    wrapper_type, wrapped_tensor_container, requires_grad, grad_fmt, dtype, device
+    wrapper_type, wrapped_tensor_container, requires_grad, grad_fmt
 ):
     assert issubclass(wrapper_type, SparseTensorWrapper)
+    wt = wrapped_tensor_container[0]
+    dtype = wt.dtype if hasattr(wt, 'dtype') else wt.to_dense().dtype
+    device = wt.device if hasattr(wt, 'device') else wt.to_dense().device
     result = SparseTensorWrapper(
         wrapped_tensor_container, requires_grad, grad_fmt, dtype, device
     )
