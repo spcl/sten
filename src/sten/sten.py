@@ -295,7 +295,7 @@ def sparse_redirect_impl(base_impl, func, _types, *args, **kwargs):
                 )
 
     warnings.warn(
-        f"Using fallback dense implementation for read-only access without tensor output: {torch.overrides.resolve_name(func)}",
+        f"Using fallback dense implementation for read-only access without tensor output: {torch_name(func)}",
         DispatchError,
     )
     d_args = densify(args)
@@ -400,12 +400,24 @@ def flattened_tensors(args):
 OP_SEMANTICS_CACHE = {}
 
 
+def torch_name(op):
+    if hasattr(torch.overrides, 'resolve_name'):
+        return torch.overrides.resolve_name(op)
+    else:
+        # PyTorch < 1.12
+        if hasattr(op, '__module__'):
+            return f"{op.__module__}.{op.__name__}"
+        elif hasattr(op, '__objclass__'):
+            return f"{op.__objclass__}.{op.__name__}"
+        return op.__name__
+
+
 def check_op_semantics(op, args, kwargs):
     if op in OP_SEMANTICS_CACHE:
         return OP_SEMANTICS_CACHE[op]
 
     warnings.warn(
-        f"Semantics of {torch.overrides.resolve_name(op)} is unknown, trying to discover it by executing...",
+        f"Semantics of {torch_name(op)} is unknown, trying to discover it by executing...",
         DispatchError,
     )
 
@@ -461,7 +473,7 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
 
     if (same_tensor == {0: 0}) and (inplace_changes == [0]) and (num_outputs == 1):
         warnings.warn(
-            f"Using fallback dense implementation for inplace operation: {torch.overrides.resolve_name(func)}",
+            f"Using fallback dense implementation for inplace operation: {torch_name(func)}",
             DispatchError,
         )
         # inplace operator that returns self (e.g. torch.Tensor.add_, torch.Tensor.copy_)
@@ -497,12 +509,12 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
     ):
         # creates new tensor that shares data with existing (e.g. torch.data.__get__, torch.Tensor.detach)
         raise NotImplementedError(
-            f"Probably {torch.overrides.resolve_name(func)} function should be dispatched in {make_new_tensor_with_data_sharing.__name__}. "
+            f"Probably {torch_name(func)} function should be dispatched in {make_new_tensor_with_data_sharing.__name__}. "
             "It is not added explicitly to prevent potential bugs."
         )
     else:
         raise NotImplementedError(
-            f"Can't create fallback implementation for {torch.overrides.resolve_name(func)}"
+            f"Can't create fallback implementation for {torch_name(func)}"
         )
 
 
@@ -909,7 +921,7 @@ def get_fwd_op_impl(operator, inp, out):
         out_str = pretty_name(out)
         err_msg = (
             f"Sparse operator implementation is not registered (fwd).\n"
-            f"op: {torch.overrides.resolve_name(operator)}\n"
+            f"op: {torch_name(operator)}\n"
             f"inp: {inp_str}\n"
             f"out: {out_str}."
         )
