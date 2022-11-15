@@ -591,11 +591,21 @@ class DenseTensor:
 
 # no-op sparsifier
 class KeepAll:
+    """Default no-op sparsifier that does nothing.
+    
+    Useful when sparsification is not required.
+    """
     def __eq__(self, other):
         return type(other) == type(self)
 
 
 class SameFormatSparsifier:
+    """Sparsifier used for in-place operators.
+    
+    Holds a copy of tensor before applying in-place operator.
+    Allows to reapply sparsification to the tensor after the
+    in-place modification with the dense result. 
+    """
     def __init__(self, ref_sp_ten):
         self.ref_sp_ten = ref_sp_ten
 
@@ -631,6 +641,18 @@ class TracedSubmodules:
 
 
 class SparsityBuilder:
+    """A registry to declare tensors in the model for sparsification.
+    
+    After initialization, the weight, intermediate tensors, and their gradients
+    need to be added in the registry. Finally, when all required tensors are
+    marked, the new sparse model can be created either as a completely independent
+    copy of original model, or as an in-place modified original model.
+    In the former case, the original model can be reused, while in the latter 
+    it should be considered to be in a dirty unusable state and accessed only
+    from the handle of returned sparse model.
+    
+    """
+    
     def __init__(self):
         self.initial_weight_sparsifiers = {}
         self.weights = {}
@@ -647,6 +669,15 @@ class SparsityBuilder:
         external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
+        """Marks the weight tensor for sparsification.
+        
+        Accepts sparsifier and the resulting format of weight tensor that should be stored in the model. 
+
+        Args:
+            name (str): Fully qualified name of the weight tensor. Example: `attention.self.query.weight`.
+            initial_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            out_format: The class of output tensor. Defaults to DenseTensor.
+        """
         self.weights[name] = (
             inline_sparsifier,
             tmp_format,
@@ -663,6 +694,19 @@ class SparsityBuilder:
         external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
+        """Marks the weight gradient tensor for sparsification.
+        
+        Accepts inline sparsifier fused into the backward operator that outputs gradient tensor in the
+        temporary tensor format. Then, temporary tensor is converted into output format using 
+        external sparsifier.
+
+        Args:
+            name (str): Fully qualified name of the weight tensor. Example: `attention.self.query.weight`.
+            inline_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            tmp_format: The class of temporary tensor. Defaults to torch.Tensor.
+            external_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            out_format: The class of output tensor. Defaults to DenseTensor.
+        """
         self.grad_weights[name] = (
             inline_sparsifier,
             tmp_format,
@@ -678,6 +722,19 @@ class SparsityBuilder:
         external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
+        """Marks the intermediate tensor for sparsification.
+        
+        Accepts inline sparsifier fused into the forward operator that outputs intermediate tensor in the
+        temporary tensor format. Then, temporary tensor is converted into output format using 
+        external sparsifier.
+
+        Args:
+            name (str): The name of the intermediate tensor assigned by torch.fx. Example: `intermediate.gelu`.
+            inline_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            tmp_format: The class of temporary tensor. Defaults to torch.Tensor.
+            external_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            out_format: The class of output tensor. Defaults to DenseTensor.
+        """
         self.interms[name] = (
             inline_sparsifier,
             tmp_format,
@@ -693,6 +750,19 @@ class SparsityBuilder:
         external_sparsifier=KeepAll(),
         out_format=DenseTensor,
     ):
+        """Marks the gradient of intermediate tensor for sparsification.
+
+        Accepts inline sparsifier fused into the backward operator that outputs gradient of intermediate tensor in the
+        temporary tensor format. Then, temporary tensor is converted into output format using 
+        external sparsifier.
+
+        Args:
+            name (str): The name of the intermediate tensor assigned by torch.fx. Example: `intermediate.gelu`.
+            inline_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            tmp_format: The class of temporary tensor. Defaults to torch.Tensor.
+            external_sparsifier: Instance of sparsifier class. Defaults to KeepAll().
+            out_format: The class of output tensor. Defaults to DenseTensor.
+        """
         self.grad_interms[name] = (
             inline_sparsifier,
             tmp_format,
@@ -753,6 +823,20 @@ class SparsityBuilder:
         return sparse_module
 
     def sparsify_model_inplace(self, module):
+        """Makes marked tensors sparse in the existing PyTorch module.
+
+        The original module passed into this function should not be used after the call.
+        
+        Example:
+            sparsity_builder = SparsityBuilder()
+            module = sparsity_builder.sparsify_model_inplace(module)
+
+        Args:
+            module (torch.nn.Module): PyTorch module to apply sparsification.
+
+        Returns:
+            torch.nn.Module: Sparse PyTorch module.
+        """
         self.fill_remaining()
 
         traced_submodules = TracedSubmodules()
@@ -800,6 +884,21 @@ class SparsityBuilder:
             return sparse_module
 
     def get_sparse_model(self, module):
+        """Makes marked tensors sparse in the copy existing PyTorch module.
+
+        The original module passed into this function is not modified and 
+        can be reused.
+        
+        Example:
+            sparsity_builder = SparsityBuilder()
+            sparse_module = sparsity_builder.sparsify_model_inplace(dense_module)
+
+        Args:
+            module (torch.nn.Module): PyTorch module to apply sparsification.
+
+        Returns:
+            torch.nn.Module: Sparse PyTorch module.
+        """
         copied_module = copy.deepcopy(module)
         return self.sparsify_model_inplace(copied_module)
 
@@ -826,6 +925,29 @@ SPARSIFIER_IMPLEMENTATIONS = {}
 
 
 def register_sparsifier_implementation(sparsifer, inp, out):
+    """Decorator to register implementation for sparsifier. 
+
+    The registered function expects
+    * sparsifier instance
+    * input tensor instance
+    * (optional) the format tuple (tmp sparsifier, tmp format, ext sparsifier, ext format) of gradient tensor (for output tensor) which should be returned by the backward operator.
+
+    Example:
+        @sten.register_sparsifier_implementation(
+            sparsifer=MyRandomFractionSparsifier, inp=torch.Tensor, out=MyCscTensor
+        )
+        def torch_tensor_to_csc_random_fraction(sparsifier, tensor, grad_fmt=None):
+            return sten.SparseTensorWrapper.wrapped_from_dense(
+                MyCscTensor(scipy.sparse.csc_matrix(sten.random_mask_sparsify(tensor, sparsifier.fraction))),
+                tensor,
+                grad_fmt,
+            )
+
+    Args:
+        sparsifer: Type of sparsifier.
+        inp: Type of input tensor.
+        out: Type of output tensor.
+    """
     def decorator(func):
         if (sparsifer, inp, out) in SPARSIFIER_IMPLEMENTATIONS:
             raise Exception(
@@ -885,6 +1007,31 @@ FWD_OP_IMPLS = {}
 
 
 def register_fwd_op_impl(operator, inp, out):
+    """Decorator to register forward implementation for operator. 
+
+    Operator implementation is expected to have the following signature:
+        ctx: context defined by PyTorch operator extension API
+        inputs: sequence of tensors in formats that match the inp argument of decorator.
+        output_sparsifiers: sequence of sparsifier instances that match the out argument of decorator.
+
+    Example:
+        @sten.register_fwd_op_impl(
+            operator=torch.mm,
+            inp=(MyCscTensor, torch.Tensor),
+            out=[(sten.KeepAll, torch.Tensor)],
+        )
+        def torch_mm_fwd_impl(ctx, inputs, output_sparsifiers):
+            input1, input2 = inputs
+            ctx.save_for_backward(input1, input2)
+            output = torch.from_numpy(input1.wrapped_tensor.data @ input2.numpy())
+            return output
+
+    Args:
+        operator: PyTorch operator (e.g. torch.add).
+        inp: Tuple that holds formats (types) of input tensors.
+        out: List (with size equal to the number of tensor outputs) of tuples (inline sparsifier, tmp format).
+    """
+    
     def decorator(func):
         FWD_OP_IMPLS[(operator, tuple(inp), tuple(out))] = func
         return func
@@ -933,6 +1080,38 @@ BWD_OP_IMPLS = {}
 
 
 def register_bwd_op_impl(operator, grad_out, grad_inp, inp):
+    """Decorator to register backward implementation for operator. 
+    
+    Operator implementation is expected to have the following signature:
+        ctx: context defined by PyTorch operator extension API
+        grad_outputs: sequence of tensors in formats that match the grad_out argument of decorator.
+        input_sparsifiers: sequence of sparsifier instances that match the inp argument of decorator.
+    
+    Example: 
+        @sten.register_bwd_op_impl(
+            operator=torch.mm,
+            grad_out=[torch.Tensor],
+            grad_inp=(
+                (sten.KeepAll, torch.Tensor),
+                (sten.KeepAll, torch.Tensor),
+            ),
+            inp=(MyCscTensor, torch.Tensor),
+        )
+        def torch_mm_bwd_impl(ctx, grad_outputs, input_sparsifiers):
+            input1, input2 = ctx.saved_tensors
+            [grad_output] = grad_outputs
+            grad_input1 = torch.mm(grad_output, input2.T)
+            grad_input2 = torch.from_numpy(
+                input1.wrapped_tensor.data.transpose() @ grad_output)
+            return grad_input1, grad_input2
+            
+    Args:
+        operator: PyTorch operator (e.g. torch.add).
+        grad_out: Tuple of types of output gradients (inputs of the backward implementation)
+        grad_inp: List (with size equal to the number of gradient inputs, which are outputs of backward implementation) of tuples (inline sparsifier, tmp format).
+        inp: Tuple that holds formats (types) of input tensors from forward pass.
+    """
+    
     def decorator(func):
         BWD_OP_IMPLS[(operator, tuple(grad_out), tuple(grad_inp), tuple(inp))] = func
         return func
@@ -1309,6 +1488,29 @@ class SparseOp:
 
 
 def sparsified_op(orig_op, out_fmt, grad_out_fmt):
+    """Creates a new operator fused with sparsification and capable of returning tensors in custom formats. 
+
+    Example:
+        sparse_add = sten.sparsified_op(
+            orig_op=torch.add,
+            out_fmt=(
+                (sten.KeepAll(), torch.Tensor,
+                MyRandomFractionSparsifier(0.5), MyCscTensor),
+            ),
+            grad_out_fmt=(
+                (sten.KeepAll(), torch.Tensor,
+                MyRandomFractionSparsifier(0.5), MyCscTensor),
+            ),
+        )
+
+    Args:
+        orig_op: Any functional operator defined in PyTorch (e.g. torch.add).
+        out_fmt: Tuple of (temporary sparsifier instance, temporary tensor format class, external sparsifier instance, external tensor format class)
+        grad_out_fmt: (temporary sparsifier instance, temporary tensor format class, external sparsifier instance, external tensor format class)
+
+    Returns:
+        Sparse operator with specified output tensor format.
+    """
     out_fmt = tuple(out_fmt)
     grad_out_fmt = tuple(grad_out_fmt)
 
