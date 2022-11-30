@@ -891,7 +891,7 @@ class SparsityBuilder:
         
         Example:
             sparsity_builder = SparsityBuilder()
-            sparse_module = sparsity_builder.sparsify_model_inplace(dense_module)
+            sparse_module = sparsity_builder.get_sparse_model(dense_module)
 
         Args:
             module (torch.nn.Module): PyTorch module to apply sparsification.
