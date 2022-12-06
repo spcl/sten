@@ -21,7 +21,7 @@ class FixedMaskTensor:
 
 
 @sten.register_sparsifier_implementation(
-    sparsifer=sten.ScalarFractionSparsifier, inp=torch.Tensor, out=FixedMaskTensor
+    sparsifier=sten.ScalarFractionSparsifier, inp=torch.Tensor, out=FixedMaskTensor
 )
 def dense_to_fixed(sparsifier, tensor, grad_fmt=None):
     num_zeros = int(sparsifier.fraction * tensor.numel())
@@ -42,7 +42,7 @@ def dense_to_fixed(sparsifier, tensor, grad_fmt=None):
 
 
 @sten.register_sparsifier_implementation(
-    sparsifer=sten.SameFormatSparsifier, inp=torch.Tensor, out=FixedMaskTensor
+    sparsifier=sten.SameFormatSparsifier, inp=torch.Tensor, out=FixedMaskTensor
 )
 def same_to_fixed(sparsifier, tensor, grad_fmt=None):
     ref = sparsifier.ref_sp_ten.wrapped_tensor

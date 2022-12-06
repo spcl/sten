@@ -135,6 +135,16 @@ class SparseMLP(torch.nn.Module):
         return self.layers(input)
 
 
+@sten.register_fwd_op_impl(
+    operator=torch.allclose,
+    inp=[torch.Tensor, sten.sten.CscTensor],
+    out=[],
+)
+def allclose_impl(ctx, inputs, output_sparsifiers):
+    input1, input2 = inputs
+    return torch.allclose(input1, input2.wrapped_tensor.to_dense())
+
+
 def test_build_mlp_from_scratch():
     sten.set_dispatch_failure("raise")
     input = torch.randn(15, 50)
@@ -245,7 +255,7 @@ class MyCscTensor:
 
 
 @sten.register_sparsifier_implementation(
-    sparsifer=MyRandomFractionSparsifier, inp=torch.Tensor, out=MyCscTensor
+    sparsifier=MyRandomFractionSparsifier, inp=torch.Tensor, out=MyCscTensor
 )
 def scalar_fraction_sparsifier_dense_coo(sparsifier, tensor):
     return sten.SparseTensorWrapper.wrapped_from_dense(
@@ -316,7 +326,7 @@ class MyCscTensorFallback:
 
 
 @sten.register_sparsifier_implementation(
-    sparsifer=MyRandomFractionSparsifierFallback,
+    sparsifier=MyRandomFractionSparsifierFallback,
     inp=torch.Tensor,
     out=MyCscTensorFallback,
 )
