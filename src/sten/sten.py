@@ -33,6 +33,10 @@ def set_dispatch_failure(action):
 # ====================== Dispatch defaults ======================
 
 
+class DispatchWarning(Warning):
+    pass
+
+
 class DispatchError(Warning):
     pass
 
@@ -365,15 +369,16 @@ def flattened_tensors(args):
 
 
 def torch_name(op):
-    if hasattr(torch.overrides, 'resolve_name'):
-        return torch.overrides.resolve_name(op)
-    else:
-        # PyTorch < 1.12
-        if hasattr(op, '__module__'):
-            return f"{op.__module__}.{op.__name__}"
-        elif hasattr(op, '__objclass__'):
-            return f"{op.__objclass__}.{op.__name__}"
-        return op.__name__
+    name = torch.overrides.resolve_name(op) if hasattr(torch.overrides, 'resolve_name') else None
+    if name is not None:
+        return name
+    
+    # PyTorch < 1.12 or external function
+    if hasattr(op, '__module__'):
+        return f"{op.__module__}.{op.__name__}"
+    elif hasattr(op, '__objclass__'):
+        return f"{op.__objclass__}.{op.__name__}"
+    return op.__name__
 
 
 class Semantics(Enum):
@@ -1333,7 +1338,7 @@ class SparseOperatorDispatcher(torch.autograd.Function):
             )
 
             if not trivially_dense:
-                warnings.warn(f"{e}\nFallback to dense implementation.", DispatchError)
+                warnings.warn(f"{e}\nFallback to dense implementation.", DispatchWarning)
                 if DISPATCH_FAILURE == DISPATCH_RAISE:
                     raise e
 
@@ -1414,12 +1419,10 @@ class SparseOperatorDispatcher(torch.autograd.Function):
         tmp_grad_inputs = op_impl_bwd(ctx, args, ginp_sp1)
         tmp_grad_inputs = canonicalize_tensor_tuple(tmp_grad_inputs)
         check_formats(f"{ctx.disp_state.orig_op} (bwd)", tmp_grad_inputs, ginp_fmt1)
-        print(f"Converting {ginp_fmt1} to {ginp_fmt2}")
         grad_inputs = tuple(
             get_sparsifier_implementation(s2.__class__, f1, f2)(s2, inp)
             for inp, f1, s2, f2 in zip(tmp_grad_inputs, ginp_fmt1, ginp_sp2, ginp_fmt2)
         )
-        print(f"Grad inputs: {[type(g) for g in grad_inputs]}")
         # make shapes of grad_inputs the same as shapes of inputs to avoid complaints from autograd
         reshaped_grad_inputs = []
         for x, ds in zip(grad_inputs, ctx.dummy_input_shapes):
@@ -1434,7 +1437,6 @@ class SparseOperatorDispatcher(torch.autograd.Function):
             else:
                 reshaped_grad_inputs.append(x)
 
-        print(f"Reshaped grad inputs: {[(type(g), g.shape) for g in reshaped_grad_inputs]}")
         return (None, *reshaped_grad_inputs)
 
 
@@ -1578,7 +1580,7 @@ def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
             # implementation that will handle args properly
             warnings.warn(
                 f"Catching {torch_name(orig_fn)} called with the sparse arguments!",
-                DispatchError,
+                DispatchWarning,
             )
             flat_d_args = densify(flat_args)
             flat_d_kwargs = densify(flat_kwargs)
