@@ -1,3 +1,4 @@
+from pyclbr import Function
 import torch
 import copy
 import numpy as np
@@ -52,7 +53,6 @@ class SparseTensorWrapper(torch.Tensor):
     # When autograd runs, it casts gradient from SparseTensorWrapper to torch.Tensor.
     # To fix it, we manually assign SparseTensorWrapper to .grad field
     def grad_fix_hook(self, grad):
-        print(f"Calling HOOK!!! {type(grad)} {grad.dtype} {grad.shape}")
         self.grad = grad
 
     def update_grad_fix_hook(self):
@@ -377,48 +377,69 @@ def torch_name(op):
 
 
 class Semantics(Enum):
-    Inplace = 1
+    Function = 1
     Method = 2
     Attribute = 3
-    Function = 4
 
 
-OP_SEMANTICS_REGISTRY = {
-    torch.add: Semantics.Function,
-    torch.nn.functional.linear: Semantics.Function,
-    torch.nn.functional.dropout: Semantics.Function,
-    torch.allclose: Semantics.Function,
-    torch.clone: Semantics.Function,
-    torch.std_mean: Semantics.Function,
-    torch.stack: Semantics.Function,
-    torch.mm: Semantics.Function,
-    torch.zeros_like: Semantics.Function,
-    torch.conv2d: Semantics.Function,
-    torch._amp_foreach_non_finite_check_and_unscale_: Semantics.Inplace,
-}
+OP_INPLACE_SEMANTICS_OVERRIDES = {}
+
+
+def is_inplace_op(op):
+    if op in OP_INPLACE_SEMANTICS_OVERRIDES:
+        return OP_INPLACE_SEMANTICS_OVERRIDES[op]
+    
+    # pessimistic autodetection
+    if op.__name__ == '__get__':
+        return False
+    elif op.__name__ == '__set__':
+        return True
+    elif op.__name__.startswith('_'):
+        # internal implementation, can do anything
+        return True
+    elif op.__name__.endswith('_'):
+        # inplace by PyTorch notation
+        return True
+    else:
+        return False
 
 
 def get_op_semantics(op):
-    if op.__name__ == '__get__':
-        # e.g. op.__self__ == torch.Tensor.shape
+    if op.__name__ in ('__get__', '__set__'):
         return Semantics.Attribute
-    elif op.__name__ == '__set__':
-        raise Exception("Not implemented")
     elif isinstance(op, types.MethodDescriptorType):
         return Semantics.Method
     else:
-        return OP_SEMANTICS_REGISTRY[op]
+        return Semantics.Function
 
 
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
     
     sem = get_op_semantics(func)
+    inplace = is_inplace_op(func)
 
-    if sem == Semantics.Inplace:
-        impl = make_sparse_catcher(func, handle_inplace_modifications=True)
-        return impl(*args, **kwargs)
+    if sem == Semantics.Attribute:
+        if inplace:
+            raise NotImplementedError("Attribute assignment is not supported")
+        else:
+            # attribute access, try to redirect to wrapped tensor (e.g. ten.shape)
+            attribute_name = func.__self__.__name__
+            self, *other_args = args
+            if hasattr(self.wrapped_tensor, attribute_name):
+                return getattr(self.wrapped_tensor, attribute_name)
+            else:
+                impl = make_sparse_catcher(func, handle_inplace_modifications=False)
+                return impl(*args, **kwargs)
+    elif sem == Semantics.Function:
+        if inplace:
+            impl = make_sparse_catcher(func, handle_inplace_modifications=True)
+            return impl(*args, **kwargs)
+        else:
+            # functional operator with backprop
+            op = sparsified_op(func, None, None)
+            res = op(*args, **kwargs)
+            return res
     elif sem == Semantics.Method:
-        # call method of a class (e.g. ten.size())
         method_name = func.__name__
         self, *other_args = args
         if hasattr(self, 'wrapped_tensor'):
@@ -429,27 +450,16 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
                     self.wrapped_tensor, *other_args, **kwargs
                 )
         # fallback
-        # TODO: currently add_ goes here.
-        impl = make_sparse_catcher(func, handle_inplace_modifications=True)
-        return impl(*args, **kwargs)
-    elif sem == Semantics.Attribute:
-        # attribute access, try to redirect to wrapped tensor (e.g. ten.shape)
-        attribute_name = func.__self__.__name__
-        self, *other_args = args
-        if hasattr(self.wrapped_tensor, attribute_name):
-            return getattr(self.wrapped_tensor, attribute_name)
-        else:
-            impl = make_sparse_catcher(func, handle_inplace_modifications=False)
+        if inplace:
+            impl = make_sparse_catcher(func, handle_inplace_modifications=True)
             return impl(*args, **kwargs)
-    elif sem == Semantics.Function:
-        # functional operator with backprop
-        op = sparsified_op(func, None, None)
-        res = op(*args, **kwargs)
-        return res
+        else:
+            # functional operator with backprop
+            op = sparsified_op(func, None, None)
+            res = op(*args, **kwargs)
+            return res
     else:
-        raise NotImplementedError(
-            f"Can't create fallback implementation for {torch_name(func)}"
-        )
+        raise Exception('Unknown semantics')
 
 
 # ======================= fallback implementations =======================

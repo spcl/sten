@@ -46,49 +46,19 @@ def sparsifier_impl(sparsifier, tensor, grad_fmt=None):
     ],
     out=[(sten.KeepAll, torch.Tensor)]
 )
-def conv2d_impl(ctx, inputs, output_sparsifiers):
-    # autocast_enabled = torch.is_autocast_enabled()
-    # with torch.autocast("cuda", enabled=False):
-    
+def conv2d_impl(ctx, inputs, output_sparsifiers):    
     input, weight, bias = inputs
     dense_weight = weight.wrapped_tensor.to_dense()
     
-    #if autocast_enabled:
-    # perform explicit cast and then call appropriate implementation
-    dt = torch.get_autocast_gpu_dtype()
-    
-    # input = input.to(dtype=dt).clone().detach()
-    # dense_weight = dense_weight.to(dtype=dt).clone().detach()
-    # bias = bias.to(dtype=dt).clone().detach()
-
-    # output = torch.nn.functional.conv2d(input, dense_weight, bias).to(dtype=torch.float32).clone().detach()
-    
-    #output = torch.from_numpy(output.cpu().numpy()).cuda()
-    
-    # input = input.clone().detach()
-    # dense_weight = dense_weight.clone().detach()
-    # bias = bias.clone().detach()
-
-    # output = torch.nn.functional.conv2d(input, dense_weight, bias).clone().detach()
-    
-    def fullclone(inp):
-        #return torch.from_numpy(inp.cpu().numpy()).cuda()
-        #return inp.detach().clone()
-        return inp#.clone().detach()
-    
     if torch.is_autocast_enabled():
-        print('with autocast')
-        input = fullclone(input)
-        dense_weight = fullclone(dense_weight)
-        bias = fullclone(bias)
+        # perform explicit cast and then call appropriate implementation
+        dt = torch.get_autocast_gpu_dtype()
         output = torch.nn.functional.conv2d(
-            input.to(dtype=torch.float16),
-            dense_weight.to(dtype=torch.float16),
-            bias.to(dtype=torch.float16),
-        )#.to(dtype=torch.float32)
-        output = fullclone(output)
+            input.to(dtype=dt),
+            dense_weight.to(dtype=dt),
+            bias.to(dtype=dt),
+        )
     else:
-        print('without autocast')
         output = torch.nn.functional.conv2d(
             input,
             dense_weight,
@@ -113,13 +83,9 @@ def conv2d_impl(ctx, inputs, output_sparsifiers):
 def conv2d_bwd_impl(ctx, grad_outputs, input_sparsifiers):
     input, weight, bias = ctx.saved_tensors
         
-    # if input.dtype != torch.float16:
-    #     raise Exception('asdfjklasrg32iu 34ilut ')
-        
     [doutput] = grad_outputs
     
     if doutput.dtype == torch.float16:
-        print('bwd with autocast')
         ci = input.detach().clone().to(dtype=torch.float16).requires_grad_(True)
         cw = weight.detach().clone().to(dtype=torch.float16).requires_grad_(True)
         cb = bias.detach().clone().to(dtype=torch.float16).requires_grad_(True)
@@ -127,7 +93,6 @@ def conv2d_bwd_impl(ctx, grad_outputs, input_sparsifiers):
             output = torch.nn.functional.conv2d(ci, cw, cb)
         output.backward(doutput)
     else:
-        print('bwd without autocast')
         ci = input.detach().clone().requires_grad_(True)
         cw = weight.detach().clone().requires_grad_(True)
         cb = bias.detach().clone().requires_grad_(True)
@@ -155,9 +120,7 @@ def amp_iteration(model, x):
     with torch.autocast(device_type='cuda', dtype=torch.float16):
         y = model(x)
         l = loss(y, torch.ones_like(y))
-    
-    #l.backward()
-    
+        
     scaler.scale(l).backward()
     if type(model[0].weight) != torch.nn.parameter.Parameter:
         assert type(model[0].weight.grad) != torch.Tensor
@@ -168,6 +131,9 @@ def amp_iteration(model, x):
 
 
 def test_simple():
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return
+    
     model = torch.nn.Sequential(
         torch.nn.Conv2d(3,5,3),
         torch.nn.ReLU(),
