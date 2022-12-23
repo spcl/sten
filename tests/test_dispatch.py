@@ -206,6 +206,16 @@ def test_sizes():
     assert msx.shape == "shape_ok"
 
 
+def test_scalar_mul():
+    shape = (3, 3)
+    dx = torch.full(shape, 2.0, requires_grad=True)
+    sx = SparseTensorWrapper.wrapped_from_dense(
+        DenseTensor(dx),
+        dx,
+    )
+    assert torch.allclose(5 * sx, sx * 5)
+
+
 if __name__ == "__main__":
     test_add()
     test_add_()
@@ -217,3 +227,4 @@ if __name__ == "__main__":
     test__eq__()
     test__repr__()
     test_sizes()
+    test_scalar_mul()

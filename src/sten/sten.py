@@ -189,6 +189,12 @@ class SparseTensorWrapper(torch.Tensor):
     def wrapped_tensor(self, value):
         self._wrapped_tensor_container[0] = value
 
+    def __mul__(self, rhs):
+        return torch.mul(self, rhs)
+
+    def __rmul__(self, lhs):
+        return torch.mul(lhs, self)
+
 
 class SparseParameterWrapper(SparseTensorWrapper, torch.nn.parameter.Parameter):
     @staticmethod
@@ -1140,6 +1146,7 @@ PATCHED_OVERRIDES = {
     torch.eq: lambda input, other, *, out=None: -1,
     torch.Tensor.eq: lambda input, other: -1,
     torch.zeros_like: lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1,
+    torch.mul: lambda input, other, *, out=None: -1,
 }
 
 
@@ -1979,7 +1986,7 @@ def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifier
     grad_output = grad_output1.wrapped_tensor.data
     grad_input = grad_output * (
         0.5 * (1 + torch.erf(2 ** (-0.5) * input))
-        + input * torch.exp(-(input ** 2) / 2) * (2 * torch.pi) ** (-0.5)
+        + input * torch.exp(-(input**2) / 2) * (2 * torch.pi) ** (-0.5)
     )
     return grad_input
 
