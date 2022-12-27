@@ -2,6 +2,7 @@ import torch
 import sten
 import numpy as np
 import scipy, scipy.sparse
+import copy
 
 
 def test_simple_graph():
@@ -414,6 +415,41 @@ def test_fallback_implementations():
 # ================ Custom implementations ================
 
 
+from test_patching import FixedMaskTensor
+
+
+def test_optimizer_sparsification():
+    model = torch.nn.Linear(20, 30)
+
+    orig_weight = copy.deepcopy(model.weight)
+
+    sb = sten.SparsityBuilder()
+    sparsifier = sten.ScalarFractionSparsifier(0.0)
+    sb.set_weight(
+        name="weight",
+        initial_sparsifier=sparsifier,
+        out_format=FixedMaskTensor,
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+
+    model, optimizer = sb.sparsify_model_and_optimizer_inplace(model, optimizer)
+
+    loss = torch.nn.L1Loss()
+
+    x = torch.randn(13, 20)
+    y = model(x)
+    l = loss(y, torch.ones_like(y))
+    l.backward()
+
+    assert torch.equal(orig_weight, model.weight)
+
+    optimizer.step()
+    optimizer.zero_grad()
+
+    assert not torch.allclose(orig_weight, model.weight)
+
+
 if __name__ == "__main__":
     test_simple_graph()
     test_modify_transformer_encoder_layer()
@@ -421,3 +457,4 @@ if __name__ == "__main__":
     test_modify_bert_encoder()
     test_custom_implementations()
     test_fallback_implementations()
+    test_optimizer_sparsification()

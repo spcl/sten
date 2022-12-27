@@ -859,6 +859,45 @@ class SparsityBuilder:
 
             return sparse_module
 
+    def sparsify_model_and_optimizer_inplace(self, module, optimizer):
+        """Makes marked tensors sparse in the existing PyTorch module.
+        In addition, it makes inplace updates in the optimizer,
+        so it does not need to be re-created.
+
+        The original module passed into this function should not be used after the call.
+
+        Example:
+            sparsity_builder = SparsityBuilder()
+            module, optimizer = sparsity_builder.sparsify_model_inplace(module, optimizer)
+
+        Args:
+            module (torch.nn.Module): PyTorch module to apply sparsification.
+            optimizer (torch.optim.Optimizer): Optimizer that references parameters of the module.
+
+        Returns:
+            torch.nn.Module: Sparse PyTorch module.
+            torch.optim.Optimizer: Optimizer with updated references to parameters.
+        """
+
+        param_ids_before = []
+        for param in module.parameters():
+            param_ids_before.append(id(param))
+
+        param_locations = {}
+        for group_id, group in enumerate(optimizer.param_groups):
+            for param_id, param in enumerate(group["params"]):
+                param_locations[id(param)] = (group_id, param_id)
+
+        module = self.sparsify_model_inplace(module)
+
+        for param, old_id in zip(module.parameters(), param_ids_before):
+            new_id = id(param)
+            if old_id != new_id:
+                group_id, param_id = param_locations[old_id]
+                optimizer.param_groups[group_id]["params"][param_id] = param
+
+        return module, optimizer
+
     def get_sparse_model(self, module):
         """Makes marked tensors sparse in the copy existing PyTorch module.
 
