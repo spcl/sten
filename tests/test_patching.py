@@ -5,6 +5,8 @@ import copy
 import os
 import gc
 import socket
+import inspect
+import pytest
 
 
 class FixedMaskTensor:
@@ -298,5 +300,64 @@ def test_ddp():
     )
 
 
+def test_fused_lamb():
+    try:
+        import apex
+    except ImportError:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            pytest.skip("Skip FusedLamb test as NVIDIA Apex is not installed")
+        else:
+            return
+
+    model = MyModule()
+
+    sparse_weight_path = "l0.weight"
+
+    sb = sten.SparsityBuilder()
+    sparsifier = sten.ScalarFractionSparsifier(0.7)
+    sb.set_weight(
+        name=sparse_weight_path,
+        initial_sparsifier=sparsifier,
+        out_format=FixedMaskTensor,
+    )
+    sb.set_weight_grad(
+        name=sparse_weight_path,
+        external_sparsifier=sparsifier,
+        out_format=FixedMaskTensor,
+    )
+
+    model = sb.sparsify_model_inplace(model)
+
+    optimizer = apex.optimizers.FusedLAMB(
+        model.parameters(),
+        lr=0.01,
+        use_nvlamb=True,
+    )
+    assert not inspect.isbuiltin(optimizer.multi_tensor_lamb)
+    assert not inspect.isbuiltin(optimizer.multi_tensor_l2norm)
+
+    if torch.cuda.device_count() == 0:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            pytest.skip("No CUDA-capable device found")
+        else:
+            return
+
+    input = torch.randn(2, 3).cuda()
+    target = torch.randn(2, 7).cuda()
+    model = model.cuda()
+    orig_weight = copy.deepcopy(model.l0.weight)
+    optimizer = apex.optimizers.FusedLAMB(
+        model.parameters(),
+        lr=0.01,
+        use_nvlamb=True,
+    )
+    loss = model(input, target)
+    loss.backward()
+    assert torch.equal(orig_weight, model.l0.weight)
+    optimizer.step()
+    assert not torch.equal(orig_weight, model.l0.weight)
+
+
 if __name__ == "__main__":
     test_ddp()
+    test_fused_lamb()

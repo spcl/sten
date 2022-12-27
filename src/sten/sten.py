@@ -9,6 +9,7 @@ import types
 import random
 import warnings
 from enum import Enum
+import functools
 
 
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
@@ -153,11 +154,10 @@ class SparseTensorWrapper(torch.Tensor):
 
     def init_from_other(self, other):
         assert isinstance(other, SparseTensorWrapper)
+        change_wrapper_metadata(self, other.device, other.dtype)
         self.wrapped_tensor = other.wrapped_tensor
         self.requires_grad = other.requires_grad
         self.grad_fmt = other.grad_fmt
-        if self.dtype != other.dtype or self.device != other.device:
-            raise Exception("This should never happen.")
 
     def __repr__(self):
         return f"SparseTensorWrapper:\n" f"{self.wrapped_tensor}"
@@ -257,6 +257,14 @@ def get_dummy_shape(tensor):
     return dummy_shape
 
 
+def change_wrapper_metadata(tensor, device, dtype):
+    assert isinstance(tensor, SparseTensorWrapper)
+    old_class = tensor.__class__
+    tensor.__class__ = torch.Tensor
+    tensor.data = tensor.data.to(device=device, dtype=dtype)
+    tensor.__class__ = old_class
+
+
 @implements(
     torch.Tensor.backward,
 )
@@ -288,7 +296,19 @@ def make_new_tensor_with_data_sharing(base_impl, func, types, *args, **kwargs):
 
 @implements(torch.Tensor.data.__set__)
 def sparse_tensor_data_set(base_impl, func, types, *args, **kwargs):
-    args[0].copy_(args[1])
+    lhs, rhs = args
+    # PyTorch semantics for x.data = y assignment is shallow copy.
+    # We can support it when both tensors are sparse
+    # but end up making deep copy with conversion when it is not possible.
+    if isinstance(lhs, SparseTensorWrapper) and isinstance(rhs, SparseTensorWrapper):
+        # shallow copy
+        lhs.wrapped_tensor = rhs.wrapped_tensor
+    else:
+        # deep copy
+        sparse_data_set = make_sparse_catcher(
+            torch.Tensor.data.__set__, handle_inplace_modifications=True
+        )
+        sparse_data_set(lhs, rhs)
 
 
 def sparse_tensor_builder(
@@ -1567,6 +1587,7 @@ def sparsified_op(orig_op, out_fmt, grad_out_fmt):
     return wrapper
 
 
+@functools.cache
 def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
     def sparse_catcher(*args, **kwargs):
         args_with_stubs, flat_args = flatten_list_of_tensors_in_args(args)
@@ -1600,7 +1621,13 @@ def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
                 # check for modifications
                 for cpy, orig, dense in zip(arg_copies, all_flat_args, all_flat_d_args):
                     if isinstance(orig, SparseTensorWrapper):
-                        if torch.equal(cpy, dense):
+                        # detect changes in device or dtype first, otherwise torch.equal will raise an exception
+                        # this may be required for x.data = y assignment when device or type of x can change
+                        if (
+                            cpy.dtype == dense.dtype
+                            and cpy.device == dense.device
+                            and torch.equal(cpy, dense)
+                        ):
                             continue  # no inplace changes
                         sparsifier = get_sparsifier_implementation(
                             SameFormatSparsifier,
@@ -1986,7 +2013,7 @@ def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifier
     grad_output = grad_output1.wrapped_tensor.data
     grad_input = grad_output * (
         0.5 * (1 + torch.erf(2 ** (-0.5) * input))
-        + input * torch.exp(-(input**2) / 2) * (2 * torch.pi) ** (-0.5)
+        + input * torch.exp(-(input ** 2) / 2) * (2 * torch.pi) ** (-0.5)
     )
     return grad_input
 

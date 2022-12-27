@@ -92,3 +92,15 @@ if torch.__version__.startswith("1.12"):
         return x
 
     patch(torch.nn.TransformerEncoderLayer.forward, patched_forward)
+
+
+# patch Nvidia Apex (https://github.com/NVIDIA/apex)
+try:
+    import apex
+    import amp_C
+    patch_scope = [mod for name, mod in sys.modules.items() if name.startswith(('apex', 'amp_C'))]
+    patch(amp_C.multi_tensor_l2norm, sten.make_sparse_catcher(amp_C.multi_tensor_l2norm), patch_scope)
+    patch(amp_C.multi_tensor_lamb, sten.make_sparse_catcher(amp_C.multi_tensor_lamb), patch_scope)
+except ImportError:
+    pass
+    
