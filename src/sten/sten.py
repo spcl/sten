@@ -10,6 +10,7 @@ import random
 import warnings
 from enum import Enum
 import functools
+import textwrap
 
 
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
@@ -1025,7 +1026,15 @@ def get_sparsifier_implementation(sparsifier, inp, out):
     # general case
     impl = SPARSIFIER_IMPLEMENTATIONS.get((sparsifier, inp, out))
     if impl is None:
-        err_msg = f"Sparsifier implementation is not registered. sparsifier: {sparsifier} inp: {inp} out: {out}."
+        err_msg = textwrap.dedent(
+            f"""\
+            Sparsifier implementation is not registered:
+            @sten.register_sparsifier_implementation(
+                sparsifier={pretty_name(sparsifier)}, inp={pretty_name(inp)}, out={pretty_name(out)}
+            )
+            def my_sparsifier_implementation(sparsifier, tensor, grad_fmt=None):
+                return sparsified_tensor_wrapper"""
+        )
         if DISPATCH_FAILURE == DISPATCH_WARN and inp != torch.Tensor:
             warnings.warn(
                 f"{err_msg} Use fallback implementation. {sparsifier} inp: {torch.Tensor} out: {out}",
@@ -1087,9 +1096,17 @@ def register_fwd_op_impl(operator, inp, out):
 
 
 def pretty_name(obj):
-    if isinstance(obj, (list, tuple)):
-        return type(obj)([pretty_name(o) for o in obj])
-    return str(obj)
+    if isinstance(obj, list):
+        return "[" + ", ".join([pretty_name(o) for o in obj]) + "]"
+    elif isinstance(obj, tuple):
+        return "(" + ", ".join([pretty_name(o) for o in obj]) + ")"
+    if inspect.isclass(obj):
+        if obj.__module__ in ("builtins", "__main__"):
+            return obj.__qualname__
+        else:
+            return obj.__module__ + "." + obj.__qualname__
+    else:
+        return str(obj)
 
 
 def check_dense_inputs(inp):
@@ -1119,11 +1136,16 @@ def get_fwd_op_impl(operator, inp, out):
     if impl is None:
         inp_str = pretty_name(inp)
         out_str = pretty_name(out)
-        err_msg = (
-            f"Sparse operator implementation is not registered (fwd).\n"
-            f"op: {torch_name(operator)}\n"
-            f"inp: {inp_str}\n"
-            f"out: {out_str}."
+        err_msg = textwrap.dedent(
+            f"""\
+                Sparse operator implementation is not registered (fwd):
+                @sten.register_fwd_op_impl(
+                    operator={torch_name(operator)},
+                    inp={inp_str},  {'# default (dense)' if inp is None else ''}
+                    out={out_str},  {'# default (dense)' if out is None else ''}
+                )
+                def my_operator(ctx, inputs, output_sparsifiers):
+                    return outputs"""
         )
         raise DispatchError(err_msg)
     return impl
@@ -1187,12 +1209,17 @@ def get_bwd_op_impl(operator, grad_out, grad_inp, inp):
         grad_out_str = pretty_name(grad_out)
         grad_inp_str = pretty_name(grad_inp)
         inp_str = pretty_name(inp)
-        err_msg = (
-            f"Sparse operator implementation is not registered (bwd).\n"
-            f"    op: {pretty_name(operator)}\n"
-            f"    grad_out: {grad_out_str}\n"
-            f"    grad_inp: {grad_inp_str}\n"
-            f"    inp: {inp_str}."
+        err_msg = textwrap.dedent(
+            f"""\
+                Sparse operator implementation is not registered (bwd):
+                @sten.register_bwd_op_impl(
+                    operator={torch_name(operator)},
+                    grad_out={grad_out_str},  {'# default (dense)' if grad_out is None else ''}
+                    grad_inp={grad_inp_str},  {'# default (dense)' if grad_inp is None else ''}
+                    inp={inp_str},  {'# default (dense)' if inp is None else ''}
+                )
+                def my_operator(ctx, grad_outputs, input_sparsifiers):
+                    return grad_inputs"""
         )
         raise DispatchError(err_msg)
     return impl
