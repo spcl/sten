@@ -16,6 +16,7 @@ import warnings
 from sten import DispatchError
 from sten import make_sparse_catcher
 
+
 @cache
 def get_member_funcs(subclass):
     return [
@@ -98,9 +99,107 @@ if torch.__version__.startswith("1.12"):
 try:
     import apex
     import amp_C
-    patch_scope = [mod for name, mod in sys.modules.items() if name.startswith(('apex', 'amp_C'))]
-    patch(amp_C.multi_tensor_l2norm, sten.make_sparse_catcher(amp_C.multi_tensor_l2norm), patch_scope)
-    patch(amp_C.multi_tensor_lamb, sten.make_sparse_catcher(amp_C.multi_tensor_lamb), patch_scope)
+
+    patch_scope = [
+        mod for name, mod in sys.modules.items() if name.startswith(("apex", "amp_C"))
+    ]
+    patch(
+        amp_C.multi_tensor_l2norm,
+        sten.make_sparse_catcher(amp_C.multi_tensor_l2norm),
+        patch_scope,
+    )
+    patch(
+        amp_C.multi_tensor_lamb,
+        sten.make_sparse_catcher(amp_C.multi_tensor_lamb),
+        patch_scope,
+    )
 except ImportError:
     pass
-    
+
+
+# patch PyTorch Distributed Data Parallel
+
+
+def sparse_ddp_all_reduce_hook(state, bucket):
+    dense_buf = bucket.buffer()
+
+    total_elems = 0
+    for p in bucket.parameters():
+        if isinstance(p, sten.SparseTensorWrapper):
+            total_elems += p.numel()
+
+    # reduce all sparse tensors
+    sparse_buf = torch.zeros(
+        max(total_elems, 1), dtype=dense_buf.dtype, device=dense_buf.device
+    )
+    processed = 0
+    for p in bucket.parameters():
+        if isinstance(p, sten.SparseTensorWrapper):
+            sparse_buf[
+                processed : processed + p.numel()
+            ] = p.grad.wrapped_tensor.to_dense().flatten()
+            processed += p.numel()
+    assert processed == total_elems
+
+    sparse_buf /= torch.distributed.get_world_size()
+    fut_sparse = torch.distributed.all_reduce(
+        sparse_buf, op=torch.distributed.ReduceOp.SUM, async_op=True
+    ).get_future()
+
+    fut_sparse.wait()
+
+    # reduce all dense tensors
+    dense_buf /= torch.distributed.get_world_size()
+    fut_dense = torch.distributed.all_reduce(
+        dense_buf, op=torch.distributed.ReduceOp.SUM, async_op=True
+    ).get_future()
+
+    fut_dense.wait()
+
+    fut = torch.futures.collect_all([fut_sparse, fut_dense])
+
+    def postporcess(fut):
+        spase_fut, dense_fut = fut.value()
+        [sparse_buf] = spase_fut.value()
+        [dense_buf] = dense_fut.value()
+        # process sparse gradients maqnually
+        processed = 0
+        for p in bucket.parameters():
+            if isinstance(p, sten.SparseTensorWrapper):
+                dense_grad = sparse_buf[processed : processed + p.numel()].reshape(
+                    p.shape
+                )
+                sparsifier = sten.get_sparsifier_implementation(
+                    sten.SameFormatSparsifier,
+                    torch.Tensor,
+                    p.grad.wrapped_tensor.__class__,
+                )
+                reduced_sparse_grad = sparsifier(
+                    sten.SameFormatSparsifier(p.grad), dense_grad
+                )
+                p.grad.init_from_other(reduced_sparse_grad)
+                processed += p.numel()
+        assert processed == total_elems
+        # return dense_buf as is, it will be used to update grad values of dense tensors by DDP
+        return dense_buf
+
+    return fut.then(postporcess)
+
+
+def patch_ddp():
+    orig_ddp_init = torch.nn.parallel.DistributedDataParallel.__init__
+    patch_scope = [
+        mod for name, mod in sys.modules.items() if name.startswith(("torch"))
+    ]
+
+    def my_ddp_init(*args, **kwargs):
+        orig_ddp_init(*args, **kwargs)
+        self, module, *_ = args
+        # add comm hook only if model has sparse parameters
+        if any(isinstance(p, sten.SparseParameterWrapper) for p in module.parameters()):
+            self.register_comm_hook(state=None, hook=sparse_ddp_all_reduce_hook)
+
+    patch(orig_ddp_init, my_ddp_init, patch_scope)
+
+
+patch_ddp()
