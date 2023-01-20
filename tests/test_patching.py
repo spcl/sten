@@ -230,6 +230,7 @@ def test_ddp():
 def test_fused_lamb():
     try:
         import apex
+        import amp_C
     except ImportError:
         if "PYTEST_CURRENT_TEST" in os.environ:
             pytest.skip("Skip FusedLamb test as NVIDIA Apex is not installed")
