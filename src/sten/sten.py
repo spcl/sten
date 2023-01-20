@@ -1233,6 +1233,7 @@ PATCHED_OVERRIDES = {
     torch.Tensor.eq: lambda input, other: -1,
     torch.zeros_like: lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1,
     torch.mul: lambda input, other, *, out=None: -1,
+    torch.abs: lambda input, *, out=None: -1,
 }
 
 
@@ -1645,6 +1646,29 @@ def sparsified_op(orig_op, out_fmt, grad_out_fmt):
     Returns:
         Sparse operator with specified output tensor format.
     """
+
+    if (out_fmt is not None) or (grad_out_fmt is not None):
+        # fill default formats
+        if out_fmt is None:
+            out_fmt = [
+                [KeepAll(), torch.Tensor, KeepAll(), torch.Tensor] for _ in grad_out_fmt
+            ]
+        else:
+            out_fmt = [list(x) for x in out_fmt]
+        if grad_out_fmt is None:
+            grad_out_fmt = [
+                [KeepAll(), torch.Tensor, KeepAll(), torch.Tensor] for _ in out_fmt
+            ]
+        else:
+            grad_out_fmt = [list(x) for x in grad_out_fmt]
+        # check that sparse tensors always have corresponding dense tensors in the backward pass
+        for out, grad_out in zip(out_fmt, grad_out_fmt):
+            if (out[3] == torch.Tensor) != (grad_out[3] == torch.Tensor):
+                # automatically require DenseTensor as needed
+                if out[3] == torch.Tensor:
+                    out[3] = DenseTensor
+                if grad_out[3] == torch.Tensor:
+                    grad_out[3] = DenseTensor
 
     def wrapper(*args, **kwargs):
         op = SparseOp(orig_op, out_fmt, grad_out_fmt)
@@ -2079,7 +2103,7 @@ def sparse_torch_nn_functional_gelu_bwd_impl(ctx, grad_outputs, input_sparsifier
     grad_output = grad_output1.wrapped_tensor.data
     grad_input = grad_output * (
         0.5 * (1 + torch.erf(2 ** (-0.5) * input))
-        + input * torch.exp(-(input ** 2) / 2) * (2 * torch.pi) ** (-0.5)
+        + input * torch.exp(-(input**2) / 2) * (2 * torch.pi) ** (-0.5)
     )
     return grad_input
 

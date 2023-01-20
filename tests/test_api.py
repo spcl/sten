@@ -450,6 +450,27 @@ def test_optimizer_sparsification():
     assert not torch.allclose(orig_weight, model.weight)
 
 
+def test_gradient_autowrapping():
+    sparse_abs = sten.sparsified_op(
+        orig_op=torch.abs,
+        out_fmt=[
+            (
+                sten.KeepAll(),
+                sten.torch.Tensor,
+                sten.RandomFractionSparsifier(0.6),
+                sten.CsrTensor,
+            ),
+        ],
+        grad_out_fmt=[
+            (sten.KeepAll(), torch.Tensor, sten.KeepAll(), torch.Tensor),
+        ],
+    )
+    x = torch.randn(10, 20, requires_grad=True)
+    z = torch.abs(sparse_abs(x))
+    grad_z = torch.randn_like(z)
+    z.backward(grad_z)
+
+
 if __name__ == "__main__":
     test_simple_graph()
     test_modify_transformer_encoder_layer()
@@ -458,3 +479,4 @@ if __name__ == "__main__":
     test_custom_implementations()
     test_fallback_implementations()
     test_optimizer_sparsification()
+    test_gradient_autowrapping()
