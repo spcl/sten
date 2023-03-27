@@ -2,35 +2,6 @@ import torch
 import sten
 
 
-@sten.register_sparsifier_implementation(
-    sparsifier=sten.ScalarFractionSparsifier,
-    inp=torch.Tensor,
-    out=sten.MaskedSparseTensor,
-)
-def sparsifier_impl(sparsifier, tensor, grad_fmt=None):
-    sparse_ten = sten.random_mask_sparsify(tensor, sparsifier.fraction)
-    return sten.SparseTensorWrapper.wrapped_from_dense(
-        sten.MaskedSparseTensor(sparse_ten, inplace_sparsifier=sparsifier),
-        tensor,
-        grad_fmt,
-    )
-
-
-@sten.register_sparsifier_implementation(
-    sparsifier=sten.SameFormatSparsifier,
-    inp=torch.Tensor,
-    out=sten.MaskedSparseTensor,
-)
-def sparsifier_impl(sparsifier, tensor, grad_fmt=None):
-    ref_sp = sparsifier.ref_sp_ten.wrapped_tensor.sparsifier
-    sparse_ten = sten.random_mask_sparsify(tensor, ref_sp.fraction)
-    return sten.SparseTensorWrapper.wrapped_from_dense(
-        sten.MaskedSparseTensor(sparse_ten, ref_sp),
-        tensor,
-        grad_fmt,
-    )
-
-
 @sten.register_fwd_op_impl(
     operator=torch.nn.functional.conv2d,
     inp=[torch.Tensor, sten.MaskedSparseTensor, torch.Tensor],

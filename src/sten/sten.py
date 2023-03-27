@@ -178,7 +178,9 @@ class SparseTensorWrapper(torch.Tensor):
         except Exception as e:
             # Keep this error message to have an opportunity to catch the error
             # if exception is not reraised.
-            warnings.warn(f"Exception raised during handling __torch_function__: {e}")
+            warnings.warn(
+                f"Exception raised during handling __torch_function__ ({func}): {e}"
+            )
             # Sometimes this exception is silently ignored by PyTorch.
             raise e
 
@@ -447,7 +449,6 @@ def get_op_semantics(op):
 
 
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
-
     sem = get_op_semantics(func)
     inplace = is_inplace_op(func)
 
@@ -1199,7 +1200,6 @@ def register_bwd_op_impl(operator, grad_out, grad_inp, inp):
 
 
 def get_bwd_op_impl(operator, grad_out, grad_inp, inp):
-
     grad_out = canonicalize_list_of_tensor_formats(grad_out)
     grad_inp = canonicalize_list_of_sparsifier_ten_fmt_pairs(grad_inp)
     inp = canonicalize_list_of_tensor_formats(inp)
@@ -1226,24 +1226,42 @@ def get_bwd_op_impl(operator, grad_out, grad_inp, inp):
 
 
 PATCHED_OVERRIDES = {
-    torch.add: lambda input, other, *, out=None: -1,
-    torch.Tensor.add: lambda self, other, *, out=None: -1,
+    torch.add: lambda input, other, *, alpha=1, out=None: -1,
+    torch.Tensor.add: lambda self, other, *, alpha=1: -1,
     torch.stack: lambda tensors, dim=0, *, out=None: -1,
     torch.eq: lambda input, other, *, out=None: -1,
     torch.Tensor.eq: lambda input, other: -1,
     torch.zeros_like: lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1,
     torch.mul: lambda input, other, *, out=None: -1,
     torch.abs: lambda input, *, out=None: -1,
+    torch.Tensor.to: (
+        lambda dtype, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
+        lambda device=None, dtype=None, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
+        lambda other, non_blocking=False, *, copy=False: -1,
+    ),
 }
+
+
+def full_bind_impl(func, args, kwargs):
+    signature = inspect.signature(func)
+    bound_args = signature.bind(*args, **kwargs)
+    bound_args.apply_defaults()
+    return bound_args
 
 
 def bind_func_signature(original_func, args, kwargs):
     override_dict = torch.overrides.get_testing_overrides()
     dummy_func = PATCHED_OVERRIDES.get(original_func, override_dict[original_func])
-    signature = inspect.signature(dummy_func)
-    bound_args = signature.bind(*args, **kwargs)
-    bound_args.apply_defaults()
-    return bound_args
+    if isinstance(dummy_func, tuple):
+        exceptions = []
+        for f in dummy_func:
+            try:
+                return full_bind_impl(f, args, kwargs)
+            except Exception as e:
+                exceptions.append(e)
+        raise KeyError(f"Failed to bind any of signatures to the args. {exceptions}")
+    else:
+        return full_bind_impl(dummy_func, args, kwargs)
 
 
 def simplify_tensor_tuple(tensors):
@@ -1939,11 +1957,39 @@ def random_fraction_sparsifier_dense_csr(sparsifier, tensor, grad_fmt=None):
 )
 def scalar_fraction_sparsifier_dense_csr(sparsifier, tensor, grad_fmt=None):
     return torch_tensor_to_csr(
-        KeepAll(), random_mask_sparsify(tensor, sparsifier.fraction), grad_fmt
+        KeepAll(), scalar_mask_sparsify(tensor, sparsifier.fraction), grad_fmt
     )
 
 
+@register_sparsifier_implementation(
+    sparsifier=ScalarFractionSparsifier,
+    inp=torch.Tensor,
+    out=MaskedSparseTensor,
+)
+def my_sparsifier_implementation(sparsifier, tensor, grad_fmt=None):
+    return SparseTensorWrapper.wrapped_from_dense(
+        MaskedSparseTensor(
+            scalar_mask_sparsify(tensor, sparsifier.fraction),
+            sparsifier,
+        ),
+        tensor,
+        grad_fmt,
+    )
+
+
+@register_sparsifier_implementation(
+    sparsifier=SameFormatSparsifier, inp=torch.Tensor, out=MaskedSparseTensor
+)
+def my_sparsifier_implementation(sparsifier, tensor, grad_fmt=None):
+    init_sparsifier = sparsifier.ref_sp_ten.wrapped_tensor.sparsifier
+    sparsifier_impl = get_sparsifier_implementation(
+        init_sparsifier.__class__, torch.Tensor, MaskedSparseTensor
+    )
+    return sparsifier_impl(init_sparsifier, tensor, grad_fmt)
+
+
 # ====================== Sparsifier implementations ======================
+
 
 # ++++++++++++++++++++++ Forward operator implementations ++++++++++++++++++++++
 @register_fwd_op_impl(
