@@ -199,11 +199,13 @@ def linear_layers_with_ddp(rank, world_size):
         assert new_weight.grad is None
         # === check sparse grad
 
-        # check for memory leaks
-        if last_tensors_in_use is None:
-            last_tensors_in_use = tensors_in_use()
-        else:
-            assert last_tensors_in_use == tensors_in_use()
+        # we ignore step 0 because cached implementation may require more tensors
+        if step > 0:
+            # check for memory leaks
+            if last_tensors_in_use is None:
+                last_tensors_in_use = tensors_in_use()
+            else:
+                assert last_tensors_in_use == tensors_in_use()
 
     torch.distributed.destroy_process_group()
 

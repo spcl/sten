@@ -11,6 +11,7 @@ import warnings
 from enum import Enum
 import functools
 import textwrap
+import time
 
 
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
@@ -394,6 +395,17 @@ def flattened_tensors(args):
     return flat_tensors
 
 
+def flattened_sparse_tensors(args):
+    sparse_tensors = []
+
+    def flatten_sparse_tensors(a):
+        if isinstance(a, SparseTensorWrapper):
+            sparse_tensors.append(a)
+
+    apply_recurse(flatten_sparse_tensors, args)
+    return sparse_tensors
+
+
 def torch_name(op):
     name = (
         torch.overrides.resolve_name(op)
@@ -448,6 +460,32 @@ def get_op_semantics(op):
         return Semantics.Function
 
 
+def sparse_fallback_with_backprop(func, args, kwargs):
+    # don't create new instance of sparsified op if it already exists at least for one input
+    all_sparse_tensors = flattened_sparse_tensors(args) + flattened_sparse_tensors(
+        kwargs
+    )
+    op = None
+    for t in all_sparse_tensors:
+        if not hasattr(t, "sparsified_ops"):
+            continue
+        sops = t.sparsified_ops
+        if func not in sops:
+            continue
+        op = sops[func]
+        break
+    if op is None:
+        # if operator is not created earlier, create it again
+        op = sparsified_op(func, None, None)
+        # assign newly created operator to all participating tensors
+        for t in all_sparse_tensors:
+            if not hasattr(t, "sparsified_ops"):
+                t.sparsified_ops = {}
+            t.sparsified_ops[func] = op
+    res = op(*args, **kwargs)
+    return res
+
+
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
     sem = get_op_semantics(func)
     inplace = is_inplace_op(func)
@@ -470,9 +508,7 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
             return impl(*args, **kwargs)
         else:
             # functional operator with backprop
-            op = sparsified_op(func, None, None)
-            res = op(*args, **kwargs)
-            return res
+            return sparse_fallback_with_backprop(func, args, kwargs)
     elif sem == Semantics.Method:
         method_name = func.__name__
         self, *other_args = args
@@ -487,9 +523,7 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
             return impl(*args, **kwargs)
         else:
             # functional operator with backprop
-            op = sparsified_op(func, None, None)
-            res = op(*args, **kwargs)
-            return res
+            return sparse_fallback_with_backprop(func, args, kwargs)
     else:
         raise Exception("Unknown semantics")
 
@@ -530,21 +564,6 @@ def densify(args):
                 (
                     lambda x: isinstance(x, SparseTensorWrapper),
                     lambda x: x.wrapped_tensor.to_dense(),
-                )
-            ],
-            a,
-        )
-
-    return apply_recurse(cond, args)
-
-
-def recurse_detach_and_enable_grad(args):
-    def cond(a):
-        return apply_cond(
-            [
-                (
-                    lambda x: isinstance(x, torch.Tensor),
-                    lambda x: x.detach().requires_grad_(True),
                 )
             ],
             a,
@@ -1242,17 +1261,26 @@ PATCHED_OVERRIDES = {
 }
 
 
+@functools.cache
+def cached_signature(func):
+    return inspect.signature(func)
+
+
 def full_bind_impl(func, args, kwargs):
-    signature = inspect.signature(func)
+    signature = cached_signature(func)
     bound_args = signature.bind(*args, **kwargs)
     bound_args.apply_defaults()
-    return bound_args
+    return bound_args, signature
 
 
 def bind_func_signature(original_func, args, kwargs):
-    override_dict = torch.overrides.get_testing_overrides()
-    dummy_func = PATCHED_OVERRIDES.get(original_func, override_dict[original_func])
-    if isinstance(dummy_func, tuple):
+    dummy_func = PATCHED_OVERRIDES.get(original_func, None)
+    if dummy_func is None:
+        override_dict = torch.overrides.get_testing_overrides()
+        dummy_func = override_dict[original_func]
+    if not isinstance(dummy_func, tuple):
+        return full_bind_impl(dummy_func, args, kwargs)
+    else:
         exceptions = []
         for f in dummy_func:
             try:
@@ -1260,8 +1288,6 @@ def bind_func_signature(original_func, args, kwargs):
             except Exception as e:
                 exceptions.append(e)
         raise KeyError(f"Failed to bind any of signatures to the args. {exceptions}")
-    else:
-        return full_bind_impl(dummy_func, args, kwargs)
 
 
 def simplify_tensor_tuple(tensors):
@@ -1298,46 +1324,58 @@ def collapse_none_tuples(tuple_list):
 
 def create_fallback_fwd_impl(out_fmts):
     def fallback_fwd_impl(ctx, flat_args_kwargs, output_sparsifiers):
-        fallback_flat_args_kwargs = recurse_detach_and_enable_grad(
-            densify(flat_args_kwargs)
+        disp_state = ctx.disp_state
+        orig_op = disp_state["orig_op"]
+
+        fallback_flat_args_kwargs = tuple(
+            (t.wrapped_tensor.to_dense() if isinstance(t, SparseTensorWrapper) else t)
+            .detach()
+            .requires_grad_(True)
+            for t in flat_args_kwargs
         )
 
-        flat_args = fallback_flat_args_kwargs[: ctx.disp_state.num_ten_args]
-        flat_kwargs = fallback_flat_args_kwargs[ctx.disp_state.num_ten_args :]
+        num_ten_args = disp_state["num_ten_args"]
+        flat_args = fallback_flat_args_kwargs[:num_ten_args]
+        flat_kwargs = fallback_flat_args_kwargs[num_ten_args:]
 
-        args = unflatten_list_of_tensors_in_args(ctx.disp_state.args_stubs, flat_args)
+        args = unflatten_list_of_tensors_in_args(disp_state["args_stubs"], flat_args)
         kwargs = unflatten_list_of_tensors_in_args(
-            ctx.disp_state.kwargs_stubs, flat_kwargs
+            disp_state["kwargs_stubs"], flat_kwargs
         )
-        bound_args = bind_func_signature(ctx.disp_state.orig_op, args, kwargs)
+
+        bound_args = disp_state["signature"].bind(*args, **kwargs)
+        bound_args.apply_defaults()
+
         with torch.enable_grad():
-            fallback_outputs = ctx.disp_state.orig_op(
-                *bound_args.args, **bound_args.kwargs
-            )
-        indexed_input_tensors = {
-            i: inp
-            for i, inp in enumerate(fallback_flat_args_kwargs)
-            if isinstance(inp, torch.Tensor)
-        }
-        ctx.num_fwd_inputs = len(fallback_flat_args_kwargs)
-        ctx.input_tensor_indices, input_tensors = zip(*indexed_input_tensors.items())
+            fallback_outputs = orig_op(*bound_args.args, **bound_args.kwargs)
 
         outs_with_stabs, flat_outs = flatten_list_of_tensors_in_args(fallback_outputs)
 
-        ctx.num_fwd_input_tensors = len(input_tensors)
-        ctx.save_for_backward(*input_tensors, *flat_outs)
+        disp_state["num_fwd_input_tensors"] = len(fallback_flat_args_kwargs)
+        ctx.save_for_backward(*fallback_flat_args_kwargs, *flat_outs)
 
-        out_fmts_local = out_fmts
-        out_fmts_local = exact_list_of_tensor_formats(out_fmts_local, flat_outs)
-
-        output_sparsifiers = exact_list_of_sparsifiers(output_sparsifiers, flat_outs)
-
-        sparsified_flat_outs = []
-        for out_fmt, out_sp, out in zip(out_fmts_local, output_sparsifiers, flat_outs):
-            sp_impl = get_sparsifier_implementation(
-                out_sp.__class__, torch.Tensor, out_fmt
+        cache_valid = "fallback_fwd_sp_impls" in disp_state
+        if not cache_valid:
+            out_fmts_local = exact_list_of_tensor_formats(out_fmts, flat_outs)
+            output_sparsifiers = exact_list_of_sparsifiers(
+                output_sparsifiers, flat_outs
             )
-            sparsified_flat_outs.append(sp_impl(out_sp, out.detach()))
+            disp_state["fallback_fwd_out_sp"] = output_sparsifiers
+        output_sparsifiers = disp_state["fallback_fwd_out_sp"]
+
+        if not cache_valid:
+            sp_impls = [
+                get_sparsifier_implementation(out_sp.__class__, torch.Tensor, out_fmt)
+                for out_fmt, out_sp in zip(out_fmts_local, output_sparsifiers)
+            ]
+            disp_state["fallback_fwd_sp_impls"] = sp_impls
+
+        sp_impls = disp_state["fallback_fwd_sp_impls"]
+
+        sparsified_flat_outs = tuple(
+            sp_impl(out_sp, out.detach())
+            for sp_impl, out_sp, out in zip(sp_impls, output_sparsifiers, flat_outs)
+        )
 
         outputs = unflatten_list_of_tensors_in_args(
             outs_with_stabs, sparsified_flat_outs
@@ -1353,26 +1391,32 @@ def create_fallback_fwd_impl(out_fmts):
 
 def create_fallback_bwd_impl(grad_inp_fmts):
     def fallback_bwd_impl(ctx, grad_outputs, input_sparsifiers):
-        fallback_grad_outputs = densify(grad_outputs)
-        fallback_inputs = ctx.saved_tensors[: ctx.num_fwd_input_tensors]
-        fallback_outputs = ctx.saved_tensors[ctx.num_fwd_input_tensors :]
-        torch.autograd.backward(fallback_outputs, grad_tensors=fallback_grad_outputs)
-        fallback_grad_inputs_with_none = [None for _ in range(ctx.num_fwd_inputs)]
-        fallback_grad_inputs = tuple(inp.grad for inp in fallback_inputs)
-        for i, grad_inp in zip(ctx.input_tensor_indices, fallback_grad_inputs):
-            fallback_grad_inputs_with_none[i] = grad_inp
+        disp_state = ctx.disp_state
 
-        grad_inputs = []
-        for grad_inp_fmt, grad_inp_sp, grad_inp in zip(
-            grad_inp_fmts, input_sparsifiers, fallback_grad_inputs_with_none
-        ):
-            if grad_inp is None:
-                grad_inputs.append(None)
-            else:
-                sp_impl = get_sparsifier_implementation(
+        fallback_grad_outputs = densify(grad_outputs)
+        num_fwd_input_tensors = disp_state["num_fwd_input_tensors"]
+        fallback_inputs = ctx.saved_tensors[:num_fwd_input_tensors]
+        fallback_outputs = ctx.saved_tensors[num_fwd_input_tensors:]
+        torch.autograd.backward(fallback_outputs, grad_tensors=fallback_grad_outputs)
+
+        cache_valid = "fallback_bwd_sp_impls" in disp_state
+
+        if not cache_valid:
+            disp_state["fallback_bwd_sp_impls"] = tuple(
+                get_sparsifier_implementation(
                     grad_inp_sp.__class__, torch.Tensor, grad_inp_fmt
                 )
-                grad_inputs.append(sp_impl(grad_inp_sp, grad_inp))
+                for grad_inp_fmt, grad_inp_sp in zip(grad_inp_fmts, input_sparsifiers)
+            )
+        sp_impls = disp_state["fallback_bwd_sp_impls"]
+
+        grad_inputs = tuple(
+            sp_impl(grad_inp_sp, inp.grad)
+            for sp_impl, grad_inp_sp, inp in zip(
+                sp_impls, input_sparsifiers, fallback_inputs
+            )
+        )
+
         return grad_inputs
 
     return fallback_bwd_impl
@@ -1422,53 +1466,82 @@ def transpose_sequence_or_none(args, num_results):
 class SparseOperatorDispatcher(torch.autograd.Function):
     @staticmethod
     def forward(ctx, disp_state, *args_kwargs):
-        ctx.dummy_input_shapes = get_dummy_shapes(args_kwargs)
-        ctx.inp_fmt = tuple(get_format(a) for a in args_kwargs)
-        ctx.grad_inp_fmt = tuple(find_gradient_fmt(a) for a in args_kwargs)
         ctx.disp_state = disp_state
-        out_sp1, out_fmt1, out_sp2, out_fmt2 = transpose_sequence_or_none(
-            ctx.disp_state.out_fmt, 4
-        )
-        op_out_fmt = sparsifier_obj_to_classes(out_sp1, out_fmt1)
 
-        # warning: do not merge following section with try-except block for backward pass,
-        # because their trivially_dense property may be different
-        ctx.fwd_impl_fallback = False
-        # find implementation for the forward pass
-        try:
-            op_impl_fwd = get_fwd_op_impl(disp_state.orig_op, ctx.inp_fmt, op_out_fmt)
-        except DispatchError as e:
-            # are all types are trivially reducible to dense?
-            trivially_dense = check_dense_inputs(ctx.inp_fmt) and check_dense_outputs(
-                op_out_fmt
+        cache_valid = "fwd_sp_impls" in disp_state
+
+        if not cache_valid:
+            disp_state["dummy_input_shapes"] = get_dummy_shapes(args_kwargs)
+            disp_state["inp_fmt"] = tuple(get_format(a) for a in args_kwargs)
+            disp_state["grad_inp_fmt"] = tuple(
+                find_gradient_fmt(a) for a in args_kwargs
             )
+            out_sp1, out_fmt1, out_sp2, out_fmt2 = transpose_sequence_or_none(
+                ctx.disp_state["out_fmt"], 4
+            )
+            disp_state["out_fmt4"] = (out_sp1, out_fmt1, out_sp2, out_fmt2)
+            disp_state["op_out_fmt"] = sparsifier_obj_to_classes(out_sp1, out_fmt1)
 
-            if not trivially_dense:
-                warnings.warn(
-                    f"{e}\nFallback to dense implementation.", DispatchWarning
+            # warning: do not merge following section with try-except block for backward pass,
+            # because their trivially_dense property may be different
+            disp_state["fwd_impl_fallback"] = False
+            # find implementation for the forward pass
+            try:
+                disp_state["op_impl_fwd"] = get_fwd_op_impl(
+                    disp_state["orig_op"],
+                    disp_state["inp_fmt"],
+                    disp_state["op_out_fmt"],
                 )
-                if DISPATCH_FAILURE == DISPATCH_RAISE:
-                    raise e
+            except DispatchError as e:
+                # are all types are trivially reducible to dense?
+                trivially_dense = check_dense_inputs(
+                    disp_state["inp_fmt"]
+                ) and check_dense_outputs(disp_state["op_out_fmt"])
 
-            # try to create fallback implementation
-            ctx.fwd_impl_fallback = True
-            op_impl_fwd = create_fallback_fwd_impl(out_fmt1)
+                if not trivially_dense:
+                    warnings.warn(
+                        f"{e}\nFallback to dense implementation.", DispatchWarning
+                    )
+                    if DISPATCH_FAILURE == DISPATCH_RAISE:
+                        raise e
+
+                # try to create fallback implementation
+                disp_state["fwd_impl_fallback"] = True
+                disp_state["op_impl_fwd"] = create_fallback_fwd_impl(out_fmt1)
+
+        inp_fmt = disp_state["inp_fmt"]
+        out_sp1, out_fmt1, out_sp2, out_fmt2 = disp_state["out_fmt4"]
+        op_out_fmt = disp_state["op_out_fmt"]
+        op_impl_fwd = disp_state["op_impl_fwd"]
 
         tmp_outputs = op_impl_fwd(ctx, args_kwargs, out_sp1)
 
         out_with_stabs, flat_out = flatten_list_of_tensors_in_args(tmp_outputs)
 
-        check_formats(f"{disp_state.orig_op} (fwd)", flat_out, out_fmt1)
+        if not cache_valid:
+            check_formats(f"{disp_state['orig_op']} (fwd)", flat_out, out_fmt1)
+            assert disp_state["out_fmt"] is None or len(flat_out) == len(
+                disp_state["out_fmt"]
+            )
+            disp_state["fwd_fmt_checked"] = True
 
-        assert disp_state.out_fmt is None or len(flat_out) == len(disp_state.out_fmt)
+            out_fmt1 = exact_list_of_tensor_formats(out_fmt1, flat_out)
+            out_sp2 = exact_list_of_sparsifiers(out_sp2, flat_out)
+            out_fmt2 = exact_list_of_tensor_formats(out_fmt2, flat_out)
+            disp_state["fwd_out_fmt_sp_fmt"] = (out_fmt1, out_sp2, out_fmt2)
 
-        out_fmt1 = exact_list_of_tensor_formats(out_fmt1, flat_out)
-        out_sp2 = exact_list_of_sparsifiers(out_sp2, flat_out)
-        out_fmt2 = exact_list_of_tensor_formats(out_fmt2, flat_out)
+        out_fmt1, out_sp2, out_fmt2 = disp_state["fwd_out_fmt_sp_fmt"]
+
+        if not cache_valid:
+            disp_state["fwd_sp_impls"] = tuple(
+                get_sparsifier_implementation(s2.__class__, f1, f2)
+                for f1, s2, f2 in zip(out_fmt1, out_sp2, out_fmt2)
+            )
+        fwd_sp_impls = disp_state["fwd_sp_impls"]
 
         outputs = tuple(
-            get_sparsifier_implementation(s2.__class__, f1, f2)(s2, tmp_out)
-            for tmp_out, f1, s2, f2 in zip(flat_out, out_fmt1, out_sp2, out_fmt2)
+            sp_impl(s2, tmp_out)
+            for sp_impl, tmp_out, s2 in zip(fwd_sp_impls, flat_out, out_sp2)
         )
 
         final_outputs = unflatten_list_of_tensors_in_args(out_with_stabs, outputs)
@@ -1477,56 +1550,80 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
-        grad_out_fmt_actual = tuple(get_format(a) for a in args)
-        gout_sp1, gout_fmt1, gout_sp2, gout_fmt2 = transpose_sequence_or_none(
-            ctx.disp_state.grad_out_fmt, 4
-        )
+        disp_state = ctx.disp_state
+        cache_valid = "bwd_sparsifier_impls" in disp_state
 
-        if canonicalize_list_of_tensor_formats(
-            gout_fmt2
-        ) != canonicalize_list_of_tensor_formats(grad_out_fmt_actual):
-            raise ValueError(
-                f"Backward implementation received output gradients of incorrect format. Expected: {ctx.disp_state.grad_out_fmt}. Actual: {grad_out_fmt_actual}."
+        if not cache_valid:
+            grad_out_fmt_actual = tuple(get_format(a) for a in args)
+            gout_sp1, gout_fmt1, gout_sp2, gout_fmt2 = transpose_sequence_or_none(
+                disp_state["grad_out_fmt"], 4
             )
 
-        ginp_sp1, ginp_fmt1, ginp_sp2, ginp_fmt2 = zip(*ctx.grad_inp_fmt)
+            if canonicalize_list_of_tensor_formats(
+                gout_fmt2
+            ) != canonicalize_list_of_tensor_formats(grad_out_fmt_actual):
+                raise ValueError(
+                    f"Backward implementation received output gradients of incorrect format. Expected: {ctx.disp_state.grad_out_fmt}. Actual: {grad_out_fmt_actual}."
+                )
 
-        op_ginp_fmt = sparsifier_obj_to_classes(ginp_sp1, ginp_fmt1)
+            disp_state["gout_fmt2"] = gout_fmt2
 
-        # find implementation for the backward pass
-        try:
-            op_impl_bwd = get_bwd_op_impl(
-                ctx.disp_state.orig_op, gout_fmt2, op_ginp_fmt, ctx.inp_fmt
-            )
-        except DispatchError as e:
-            # are all types are trivially reducible to dense?
-            trivially_dense = (
-                check_dense_inputs(gout_fmt2)
-                and check_dense_outputs(op_ginp_fmt)
-                and check_dense_inputs(ctx.inp_fmt)
-            )
+        gout_fmt2 = disp_state["gout_fmt2"]
+        ginp_sp1, ginp_fmt1, ginp_sp2, ginp_fmt2 = zip(*disp_state["grad_inp_fmt"])
 
-            if trivially_dense:
-                op_impl_bwd = create_fallback_bwd_impl(ginp_fmt1)
-            else:
-                if DISPATCH_FAILURE == DISPATCH_RAISE:
-                    raise e
+        if not cache_valid:
+            op_ginp_fmt = sparsifier_obj_to_classes(ginp_sp1, ginp_fmt1)
+
+            # find implementation for the backward pass
+            try:
+                op_impl_bwd = get_bwd_op_impl(
+                    disp_state["orig_op"], gout_fmt2, op_ginp_fmt, disp_state["inp_fmt"]
+                )
+            except DispatchError as e:
+                # are all types are trivially reducible to dense?
+                trivially_dense = (
+                    check_dense_inputs(gout_fmt2)
+                    and check_dense_outputs(op_ginp_fmt)
+                    and check_dense_inputs(disp_state["inp_fmt"])
+                )
+
+                if trivially_dense:
+                    op_impl_bwd = create_fallback_bwd_impl(ginp_fmt1)
                 else:
-                    if ctx.fwd_impl_fallback:
-                        op_impl_bwd = create_fallback_bwd_impl(ginp_fmt1)
+                    if DISPATCH_FAILURE == DISPATCH_RAISE:
+                        raise e
                     else:
-                        op_impl_bwd = create_failing_bwd_impl(e)
+                        if disp_state["fwd_impl_fallback"]:
+                            op_impl_bwd = create_fallback_bwd_impl(ginp_fmt1)
+                        else:
+                            op_impl_bwd = create_failing_bwd_impl(e)
+
+            disp_state["op_impl_bwd"] = op_impl_bwd
+
+        op_impl_bwd = disp_state["op_impl_bwd"]
 
         tmp_grad_inputs = op_impl_bwd(ctx, args, ginp_sp1)
+
         tmp_grad_inputs = canonicalize_tensor_tuple(tmp_grad_inputs)
-        check_formats(f"{ctx.disp_state.orig_op} (bwd)", tmp_grad_inputs, ginp_fmt1)
+
+        if not cache_valid:
+            check_formats(f"{disp_state['orig_op']} (bwd)", tmp_grad_inputs, ginp_fmt1)
+
+            disp_state["bwd_sparsifier_impls"] = tuple(
+                get_sparsifier_implementation(s2.__class__, f1, f2)
+                for f1, s2, f2 in zip(ginp_fmt1, ginp_sp2, ginp_fmt2)
+            )
+
+        sparsifier_impls = disp_state["bwd_sparsifier_impls"]
+
         grad_inputs = tuple(
-            get_sparsifier_implementation(s2.__class__, f1, f2)(s2, inp)
-            for inp, f1, s2, f2 in zip(tmp_grad_inputs, ginp_fmt1, ginp_sp2, ginp_fmt2)
+            spi(s2, inp)
+            for spi, inp, s2 in zip(sparsifier_impls, tmp_grad_inputs, ginp_sp2)
         )
+
         # make shapes of grad_inputs the same as shapes of inputs to avoid complaints from autograd
         reshaped_grad_inputs = []
-        for x, ds in zip(grad_inputs, ctx.dummy_input_shapes):
+        for x, ds in zip(grad_inputs, disp_state["dummy_input_shapes"]):
             if isinstance(x, SparseTensorWrapper):
                 rx = SparseTensorWrapper(
                     wrapped_tensor_container=x._wrapped_tensor_container,
@@ -1544,6 +1641,32 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 class TensorIdx:
     def __init__(self, idx):
         self.idx = idx
+
+    def __eq__(self, other):
+        return isinstance(other, TensorIdx) and (self.idx == other.idx)
+
+
+def replace_tensors_by_stubs(args):
+    last_idx = TensorIdx(0)
+
+    def process_tensor(x):
+        res = TensorIdx(last_idx.idx)
+        last_idx.idx += 1
+        return res
+
+    def cond(a):
+        return apply_cond(
+            [
+                (
+                    lambda x: isinstance(x, torch.Tensor),
+                    process_tensor,
+                ),
+            ],
+            a,
+        )
+
+    args_with_stubs = apply_recurse(cond, args)
+    return args_with_stubs
 
 
 def flatten_list_of_tensors_in_args(args):
@@ -1566,7 +1689,6 @@ def flatten_list_of_tensors_in_args(args):
         )
 
     args_with_stubs = apply_recurse(cond, args)
-
     return args_with_stubs, flat_tensors
 
 
@@ -1586,52 +1708,54 @@ def unflatten_list_of_tensors_in_args(args_with_stubs, flat_tensors):
     return args
 
 
-class DispatcherState:
-    def __init__(
-        self,
-        orig_op,
-        out_fmt,
-        grad_out_fmt,
-        args_stubs,
-        kwargs_stubs,
-        num_ten_args,
-        num_ten_kwargs,
-    ):
-        self.orig_op = orig_op
-        self.out_fmt = out_fmt
-        self.grad_out_fmt = grad_out_fmt
-        self.args_stubs = args_stubs
-        self.kwargs_stubs = kwargs_stubs
-        self.num_ten_args = num_ten_args
-        self.num_ten_kwargs = num_ten_kwargs
-
-
 class SparseOp:
     def __init__(self, orig_op, out_fmt, grad_out_fmt):
         self.orig_op = orig_op
         self.out_fmt = out_fmt
         self.grad_out_fmt = grad_out_fmt
+        self.clear_disp_state()
+
+    def clear_disp_state(self):
+        self.disp_state = {
+            "orig_op": self.orig_op,
+            "out_fmt": self.out_fmt,
+            "grad_out_fmt": self.grad_out_fmt,
+        }
 
     def __call__(self, *args, **kwargs):
-        # here we want to linearize kwargs using the signature of original function
-        bound_args = bind_func_signature(self.orig_op, args, kwargs)
-        # arguments in the order of definition
-        args_stubs, flat_args = flatten_list_of_tensors_in_args(bound_args.args)
-        kwargs_stubs, flat_kwargs = flatten_list_of_tensors_in_args(bound_args.kwargs)
-        disp_state = DispatcherState(
-            self.orig_op,
-            self.out_fmt,
-            self.grad_out_fmt,
-            args_stubs,
-            kwargs_stubs,
-            len(flat_args),
-            len(flat_kwargs),
+        pure_args_stubs, flat_args = flatten_list_of_tensors_in_args(args)
+        pure_kwargs_stubs, flat_kwargs = flatten_list_of_tensors_in_args(kwargs)
+
+        all_pure_args_stubs = self.disp_state.get("all_pure_args_stubs")
+        if all_pure_args_stubs != (pure_args_stubs, pure_kwargs_stubs):
+            self.clear_disp_state()
+            self.disp_state["all_pure_args_stubs"] = (
+                pure_args_stubs,
+                pure_kwargs_stubs,
+            )
+
+            bound_args, self.disp_state["signature"] = bind_func_signature(
+                self.disp_state["orig_op"], args, kwargs
+            )
+            self.disp_state["bound_args"] = bound_args
+
+            # arguments in the order of definition
+            args_stubs = replace_tensors_by_stubs(bound_args.args)
+            kwargs_stubs = replace_tensors_by_stubs(bound_args.kwargs)
+
+            self.disp_state["args_stubs"] = args_stubs
+            self.disp_state["kwargs_stubs"] = kwargs_stubs
+            self.disp_state["num_ten_args"] = len(flat_args)
+            self.disp_state["num_ten_kwargs"] = len(flat_kwargs)
+
+        outputs = SparseOperatorDispatcher.apply(
+            self.disp_state, *flat_args, *flat_kwargs
         )
-        outputs = SparseOperatorDispatcher.apply(disp_state, *flat_args, *flat_kwargs)
         outputs = canonicalize_tensor_tuple(outputs)
 
-        grad_out_fmt = self.grad_out_fmt
-        grad_out_fmt = exact_list_of_tensor_formats(grad_out_fmt, outputs)
+        grad_out_fmt = exact_list_of_tensor_formats(
+            self.disp_state["grad_out_fmt"], outputs
+        )
 
         for out, grad_fmt in zip(outputs, grad_out_fmt):
             if isinstance(out, SparseTensorWrapper):
@@ -1688,8 +1812,9 @@ def sparsified_op(orig_op, out_fmt, grad_out_fmt):
                 if grad_out[3] == torch.Tensor:
                     grad_out[3] = DenseTensor
 
+    op = SparseOp(orig_op, out_fmt, grad_out_fmt)
+
     def wrapper(*args, **kwargs):
-        op = SparseOp(orig_op, out_fmt, grad_out_fmt)
         return op(*args, **kwargs)
 
     return wrapper
