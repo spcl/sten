@@ -1258,6 +1258,8 @@ PATCHED_OVERRIDES = {
         lambda device=None, dtype=None, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
         lambda other, non_blocking=False, *, copy=False: -1,
     ),
+    torch.ones_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format: -1,
+    torch.addmm: lambda input, mat1, mat2, *, beta=1, alpha=1, out=None: -1,
 }
 
 

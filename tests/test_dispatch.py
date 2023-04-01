@@ -1,3 +1,4 @@
+import sten
 from sten import SparseTensorWrapper, SparseParameterWrapper, DenseTensor
 import torch
 
@@ -216,6 +217,21 @@ def test_scalar_mul():
     assert torch.allclose(5 * sx, sx * 5)
 
 
+def test_ones_like():
+    shape = (3, 3)
+    dx = torch.full(shape, 2.0, requires_grad=True)
+    sparsifier = sten.ScalarFractionSparsifier(0.5)
+    sx = SparseTensorWrapper.wrapped_from_dense(
+        sten.MaskedSparseTensor(
+            sten.scalar_mask_sparsify(dx, sparsifier.fraction),
+            sparsifier,
+        ),
+        dx,
+        None,
+    )
+    assert torch.allclose(torch.ones_like(sx), torch.ones_like(dx))
+
+
 if __name__ == "__main__":
     test_add()
     test_add_()
@@ -228,3 +244,4 @@ if __name__ == "__main__":
     test__repr__()
     test_sizes()
     test_scalar_mul()
+    test_ones_like()
