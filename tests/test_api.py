@@ -471,6 +471,84 @@ def test_gradient_autowrapping():
     z.backward(grad_z)
 
 
+class MyTestSparsifier:
+    pass
+
+
+class MyTestFormat:
+    def __init__(self, data):
+        self.data = data
+
+    def to_dense(self):
+        return self.data.detach().clone()
+
+
+@sten.register_sparsifier_implementation(
+    sparsifier=MyTestSparsifier, inp=torch.Tensor, out=MyTestFormat
+)
+def dense_to_grouped_nm(sparsifier, tensor, grad_fmt=None):
+    return sten.SparseTensorWrapper.wrapped_from_dense(
+        MyTestFormat(tensor.detach().clone()),
+        tensor,
+        grad_fmt,
+    )
+
+
+@sten.register_sparsifier_implementation(
+    sparsifier=sten.SameFormatSparsifier, inp=torch.Tensor, out=MyTestFormat
+)
+def dense_to_grouped_nm(sparsifier, tensor, grad_fmt=None):
+    wrp = sparsifier.ref_sp_ten.wrapped_tensor
+    assert isinstance(wrp, MyTestFormat)
+    # for this simple test wrp is not used
+    # but it may be practical for real sparse format
+    return sten.SparseTensorWrapper.wrapped_from_dense(
+        MyTestFormat(tensor.detach().clone()),
+        tensor,
+        grad_fmt,
+    )
+
+
+def test_grad_fmt_assignment():
+    # check that optimizer step assigns gradient properly
+    # without damaging grad_fmt field of original tensor
+    model = torch.nn.Linear(3, 5)
+    sb = sten.SparsityBuilder()
+    sb.set_weight(
+        name="weight",
+        initial_sparsifier=MyTestSparsifier(),
+        out_format=MyTestFormat,
+    )
+    sb.set_weight_grad(
+        name="weight",
+        inline_sparsifier=MyTestSparsifier(),
+        tmp_format=MyTestFormat,
+        external_sparsifier=sten.KeepAll(),
+        out_format=MyTestFormat,
+    )
+    model = sb.sparsify_model_inplace(model)
+    optim = torch.optim.AdamW(model.parameters())
+
+    def check_grad_fmt(grad_fmt):
+        assert grad_fmt[0].__class__ == MyTestSparsifier
+        assert grad_fmt[1] == MyTestFormat
+        assert grad_fmt[2].__class__ == sten.KeepAll
+        assert grad_fmt[3] == MyTestFormat
+
+    check_grad_fmt(model.weight.grad_fmt)
+
+    steps = 10
+    for _ in range(steps):
+        inp = torch.randn(2, 3)
+        outputs = model(inp)
+        loss = torch.sum(outputs)
+        loss.backward()
+        optim.step()
+        optim.zero_grad()
+
+        check_grad_fmt(model.weight.grad_fmt)
+
+
 if __name__ == "__main__":
     test_simple_graph()
     test_modify_transformer_encoder_layer()
@@ -480,3 +558,4 @@ if __name__ == "__main__":
     test_fallback_implementations()
     test_optimizer_sparsification()
     test_gradient_autowrapping()
+    test_grad_fmt_assignment()

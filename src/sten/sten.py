@@ -154,12 +154,13 @@ class SparseTensorWrapper(torch.Tensor):
         else:
             raise NotImplementedError("This should not happen.")
 
-    def init_from_other(self, other):
+    def init_from_other(self, other, replace_grad_fmt=True):
         assert isinstance(other, SparseTensorWrapper)
         change_wrapper_metadata(self, other.device, other.dtype)
         self.wrapped_tensor = other.wrapped_tensor
         self.requires_grad = other.requires_grad
-        self.grad_fmt = other.grad_fmt
+        if replace_grad_fmt:
+            self.grad_fmt = other.grad_fmt
 
     def __repr__(self):
         return f"SparseTensorWrapper:\n" f"{self.wrapped_tensor}"
@@ -529,25 +530,6 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
 
 
 # ======================= fallback implementations =======================
-
-
-def resparsify_params(args, kwargs, changed_args, changed_kwargs):
-    def resparsify(arg, changed_arg):
-        if isinstance(arg, SparseTensorWrapper):
-            sparsifier = get_sparsifier_implementation(
-                SameFormatSparsifier, torch.Tensor, arg.wrapped_tensor.__class__
-            )
-            sparse_arg = sparsifier(SameFormatSparsifier(arg), changed_arg)
-            arg.init_from_other(sparse_arg)
-        elif isinstance(arg, (list, tuple)):
-            for x, cx in zip(arg, changed_arg):
-                resparsify(x, cx)
-        elif isinstance(arg, dict):
-            for x, cx in zip(arg.values(), changed_arg.values()):
-                resparsify(x, cx)
-
-    resparsify(args, changed_args)
-    resparsify(kwargs, changed_kwargs)
 
 
 @implements(torch.Tensor.requires_grad_, torch.Tensor.requires_grad.__set__)
@@ -1871,7 +1853,7 @@ def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
                         )
                         # TODO: not sure how to distinguish full replacement and nonzero modification
                         sparse_arg = sparsifier(SameFormatSparsifier(orig), dense)
-                        orig.init_from_other(sparse_arg)
+                        orig.init_from_other(sparse_arg, replace_grad_fmt=False)
                     else:
                         assert cpy is None
             # return output
