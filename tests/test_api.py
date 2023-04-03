@@ -536,6 +536,7 @@ def test_grad_fmt_assignment():
         assert grad_fmt[3] == MyTestFormat
 
     check_grad_fmt(model.weight.grad_fmt)
+    assert model.weight.requires_grad
 
     steps = 10
     for _ in range(steps):
@@ -547,6 +548,7 @@ def test_grad_fmt_assignment():
         optim.zero_grad()
 
         check_grad_fmt(model.weight.grad_fmt)
+        assert model.weight.requires_grad
 
 
 if __name__ == "__main__":

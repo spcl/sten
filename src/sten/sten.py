@@ -154,12 +154,12 @@ class SparseTensorWrapper(torch.Tensor):
         else:
             raise NotImplementedError("This should not happen.")
 
-    def init_from_other(self, other, replace_grad_fmt=True):
+    def init_from_other(self, other, replace_attributes=True):
         assert isinstance(other, SparseTensorWrapper)
         change_wrapper_metadata(self, other.device, other.dtype)
         self.wrapped_tensor = other.wrapped_tensor
-        self.requires_grad = other.requires_grad
-        if replace_grad_fmt:
+        if replace_attributes:
+            self.requires_grad = other.requires_grad
             self.grad_fmt = other.grad_fmt
 
     def __repr__(self):
@@ -1853,7 +1853,7 @@ def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
                         )
                         # TODO: not sure how to distinguish full replacement and nonzero modification
                         sparse_arg = sparsifier(SameFormatSparsifier(orig), dense)
-                        orig.init_from_other(sparse_arg, replace_grad_fmt=False)
+                        orig.init_from_other(sparse_arg, replace_attributes=False)
                     else:
                         assert cpy is None
             # return output
