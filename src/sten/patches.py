@@ -81,9 +81,7 @@ for x in [
     patch(x, make_sparse_catcher(x))
 
 
-tva = int(torch.__version__.split(".")[0])
-tvb = int(torch.__version__.split(".")[1])
-if int(tva * 100 + tvb) > 112:
+if sten.torch_ver_as_int() > 1120:
     # patch transformer code to remove control flow and make it traceable
     def patched_forward(self, src, src_mask=None, src_key_padding_mask=None):
         x = src

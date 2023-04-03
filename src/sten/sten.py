@@ -16,6 +16,16 @@ import time
 
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
 
+
+def torch_ver_as_int():
+    torch_ver = [x for x in torch.__version__.split("+")[0].split(".")][:3]
+    torch_ver = [int(x) for x in torch_ver]
+    while len(torch_ver) < 3:
+        torch_ver.append(0)
+    torch_ver_total = torch_ver[0] * 1000 + torch_ver[1] * 10 + torch_ver[2]
+    return torch_ver_total
+
+
 # ++++++++++++++++++++++ Dispatch defaults ++++++++++++++++++++++
 
 DISPATCH_RAISE = "raise"
@@ -1232,7 +1242,6 @@ PATCHED_OVERRIDES = {
     torch.stack: lambda tensors, dim=0, *, out=None: -1,
     torch.eq: lambda input, other, *, out=None: -1,
     torch.Tensor.eq: lambda input, other: -1,
-    torch.zeros_like: lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1,
     torch.mul: lambda input, other, *, out=None: -1,
     torch.abs: lambda input, *, out=None: -1,
     torch.Tensor.to: (
@@ -1240,9 +1249,22 @@ PATCHED_OVERRIDES = {
         lambda device=None, dtype=None, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
         lambda other, non_blocking=False, *, copy=False: -1,
     ),
-    torch.ones_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format: -1,
     torch.addmm: lambda input, mat1, mat2, *, beta=1, alpha=1, out=None: -1,
+    torch.zeros_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None: -1,
+    torch.ones_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format: -1,
 }
+
+
+if torch_ver_as_int() <= 1121:
+    # Warning: layout is torch.strided instead of None because PyTorch <= 1.12.1 doesn't support None
+    PATCHED_OVERRIDES[
+        torch.zeros_like
+    ] = (
+        lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=None: -1
+    )
+    PATCHED_OVERRIDES[torch.ones_like] = (
+        lambda input, *, dtype=None, layout=torch.strided, device=None, requires_grad=False, memory_format=torch.preserve_format: -1,
+    )
 
 
 @functools.cache
