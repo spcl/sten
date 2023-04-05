@@ -123,6 +123,9 @@ except ImportError:
 
 
 def sparse_ddp_all_reduce_hook(state, bucket):
+    sten.sync_cuda()
+    t1 = time.time()
+
     dense_buf = bucket.buffer()
 
     total_elems = 0
@@ -148,17 +151,20 @@ def sparse_ddp_all_reduce_hook(state, bucket):
         sparse_buf, op=torch.distributed.ReduceOp.SUM, async_op=True
     ).get_future()
 
-    fut_sparse.wait()
-
     # reduce all dense tensors
     dense_buf /= torch.distributed.get_world_size()
     fut_dense = torch.distributed.all_reduce(
         dense_buf, op=torch.distributed.ReduceOp.SUM, async_op=True
     ).get_future()
 
-    fut_dense.wait()
-
     fut = torch.futures.collect_all([fut_sparse, fut_dense])
+
+    if sten.CUDA_PROFILING[0]:
+        fut.wait()
+
+    sten.sync_cuda()
+    t2 = time.time()
+    sten.profile_entries.setdefault("distributed_preprocess", []).append(t2 - t1)
 
     def postporcess(fut):
         spase_fut, dense_fut = fut.value()
