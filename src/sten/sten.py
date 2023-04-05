@@ -26,6 +26,28 @@ def torch_ver_as_int():
     return torch_ver_total
 
 
+CUDA_PROFILING = [False]
+
+
+def set_cuda_profiling(value=True):
+    if torch.cuda.is_available():
+        CUDA_PROFILING[0] = value
+
+
+def sync_cuda():
+    if CUDA_PROFILING[0]:
+        torch.cuda.synchronize()
+
+
+# dict with key = string name of segment, value = list of measurements
+profile_entries = {}
+
+
+def reset_profile():
+    for v in profile_entries.values():
+        v.clear()
+
+
 # ++++++++++++++++++++++ Dispatch defaults ++++++++++++++++++++++
 
 DISPATCH_RAISE = "raise"
@@ -1556,6 +1578,9 @@ class SparseOperatorDispatcher(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        sync_cuda()
+        t1 = time.time()
+
         disp_state = ctx.disp_state
         cache_valid = "bwd_sparsifier_impls" in disp_state
 
@@ -1640,6 +1665,10 @@ class SparseOperatorDispatcher(torch.autograd.Function):
                 reshaped_grad_inputs.append(rx)
             else:
                 reshaped_grad_inputs.append(x)
+
+        sync_cuda()
+        t2 = time.time()
+        profile_entries.setdefault("backward", []).append(t2 - t1)
 
         return (None, *reshaped_grad_inputs)
 
@@ -1728,7 +1757,7 @@ class SparseOp:
             "grad_out_fmt": self.grad_out_fmt,
         }
 
-    def __call__(self, *args, **kwargs):
+    def run(self, *args, **kwargs):
         pure_args_stubs, flat_args = flatten_list_of_tensors_in_args(args)
         pure_kwargs_stubs, flat_kwargs = flatten_list_of_tensors_in_args(kwargs)
 
@@ -1768,6 +1797,15 @@ class SparseOp:
                 out.grad_fmt = grad_fmt
         outputs = simplify_tensor_tuple(outputs)
         return outputs
+
+    def __call__(self, *args, **kwargs):
+        sync_cuda()
+        t1 = time.time()
+        output = self.run(*args, **kwargs)
+        sync_cuda()
+        t2 = time.time()
+        profile_entries.setdefault("SparseOp", []).append(t2 - t1)
+        return output
 
 
 def sparsified_op(orig_op, out_fmt, grad_out_fmt):
@@ -1894,7 +1932,16 @@ def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
             # default implementation
             return orig_fn(*args, **kwargs)
 
-    return sparse_catcher
+    def sparse_catcher_profiler(*args, **kwargs):
+        sync_cuda()
+        t1 = time.time()
+        res = sparse_catcher(*args, **kwargs)
+        sync_cuda()
+        t2 = time.time()
+        profile_entries.setdefault("sparse_catcher", []).append(t2 - t1)
+        return res
+
+    return sparse_catcher_profiler
 
 
 # ====================== Core implementation ======================

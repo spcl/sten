@@ -4,6 +4,7 @@ import inspect
 import sys
 import copy
 from functools import partial, cache
+import time
 
 from sten import (
     SparseTensorWrapper,
@@ -163,6 +164,8 @@ def sparse_ddp_all_reduce_hook(state, bucket):
         spase_fut, dense_fut = fut.value()
         [sparse_buf] = spase_fut.value()
         [dense_buf] = dense_fut.value()
+        sten.sync_cuda()
+        t1 = time.time()
         # process sparse gradients maqnually
         processed = 0
         for p in bucket.parameters():
@@ -181,6 +184,9 @@ def sparse_ddp_all_reduce_hook(state, bucket):
                 p.grad.init_from_other(reduced_sparse_grad)
                 processed += p.numel()
         assert processed == total_elems
+        sten.sync_cuda()
+        t2 = time.time()
+        sten.profile_entries.setdefault("distributed_postprocess", []).append(t2 - t1)
         # return dense_buf as is, it will be used to update grad values of dense tensors by DDP
         return dense_buf
 
