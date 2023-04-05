@@ -2012,7 +2012,7 @@ class ScalarFractionSparsifier:
 
 def scalar_mask_sparsify(tensor, frac):
     flat_tensor = torch.flatten(tensor)
-    sorted_idx = torch.argsort(torch.abs(flat_tensor))
+    sorted_idx = torch.argsort(torch.argsort(torch.abs(flat_tensor)))
     flat_output = torch.where(
         sorted_idx >= frac * len(flat_tensor),
         flat_tensor,
