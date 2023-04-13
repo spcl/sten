@@ -348,6 +348,60 @@ def sparse_tensor_data_set(base_impl, func, types, *args, **kwargs):
         sparse_data_set(lhs, rhs)
 
 
+def list_get(l, idx, default=None):
+    return l[idx] if len(l) > idx else default
+
+
+# torch.Tensor.to allows signatures not distinguishable using only Python call semantic.
+# Hence, it requires custom wrapper.
+@implements(torch.Tensor.to)
+def sparse_torch_tensor_to(base_impl, func, types, *args, **kwargs):
+    # There are following accepted signatures
+    # self, device=None, dtype=None, non_blocking=False, copy=False, *, memory_format=torch.preserve_format
+    # self, dtype, non_blocking=False, copy=False, *, memory_format=torch.preserve_format
+    # self, other, non_blocking=False, copy=False, *, memory_format=torch.preserve_format
+
+    if isinstance(list_get(args, 1), torch.dtype):
+        # case 2
+        device = args[0].device
+        dtype = args[1]
+        tail_args = args[2:]
+    elif isinstance(list_get(args, 1), torch.Tensor):
+        # case 3
+        device = args[1].device
+        dtype = args[1].dtype
+        tail_args = args[2:]
+    else:
+        # case 1
+        device = list_get(args, 1, kwargs.get("device"))
+        dtype = list_get(args, 2, kwargs.get("dtype"))
+        tail_args = args[3:]
+
+    non_blocking = list_get(tail_args, 0, kwargs.get("non_blocking", False))
+    copy = list_get(tail_args, 1, kwargs.get("copy", False))
+    memory_format = kwargs.get("memory_format", torch.preserve_format)
+
+    # return self if device and dtype are not changed
+    if device == args[0].device and dtype == args[0].dtype and not copy:
+        return args[0]
+
+    return sparse_fallback_with_backprop(
+        func,
+        args=[args[0]],
+        kwargs={
+            "device": device,
+            "dtype": dtype,
+            "non_blocking": non_blocking,
+            "copy": copy,
+            "memory_format": memory_format,
+        },
+        # in contrast to most purely functional operators
+        # this method is supposed to return tensor of the *same sparse format*
+        out_fmt=[(SameFormatSparsifier(args[0]), args[0].wrapped_tensor.__class__, KeepAll(), args[0].wrapped_tensor.__class__)],
+        grad_out_fmt=[args[0].grad_fmt],
+    )
+
+
 def sparse_tensor_builder(
     wrapper_type, wrapped_tensor_container, requires_grad, grad_fmt
 ):
@@ -493,7 +547,9 @@ def get_op_semantics(op):
         return Semantics.Function
 
 
-def sparse_fallback_with_backprop(func, args, kwargs):
+def sparse_fallback_with_backprop(
+    func, args, kwargs, *, out_fmt=None, grad_out_fmt=None
+):
     # don't create new instance of sparsified op if it already exists at least for one input
     all_sparse_tensors = flattened_sparse_tensors(args) + flattened_sparse_tensors(
         kwargs
@@ -509,7 +565,7 @@ def sparse_fallback_with_backprop(func, args, kwargs):
         break
     if op is None:
         # if operator is not created earlier, create it again
-        op = sparsified_op(func, None, None)
+        op = sparsified_op(func, out_fmt, grad_out_fmt)
         # assign newly created operator to all participating tensors
         for t in all_sparse_tensors:
             if not hasattr(t, "sparsified_ops"):
@@ -1266,11 +1322,7 @@ PATCHED_OVERRIDES = {
     torch.Tensor.eq: lambda input, other: -1,
     torch.mul: lambda input, other, *, out=None: -1,
     torch.abs: lambda input, *, out=None: -1,
-    torch.Tensor.to: (
-        lambda dtype, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
-        lambda device=None, dtype=None, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
-        lambda other, non_blocking=False, *, copy=False: -1,
-    ),
+    torch.Tensor.to: lambda self, device=None, dtype=None, non_blocking=False, copy=False, *, memory_format=torch.preserve_format: -1,
     torch.addmm: lambda input, mat1, mat2, *, beta=1, alpha=1, out=None: -1,
     torch.zeros_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None: -1,
     torch.ones_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format: -1,

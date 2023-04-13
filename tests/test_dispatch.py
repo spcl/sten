@@ -1,6 +1,8 @@
 import sten
 from sten import SparseTensorWrapper, SparseParameterWrapper, DenseTensor
 import torch
+import pytest
+import os
 
 
 def test_add():
@@ -232,6 +234,64 @@ def test_ones_like():
     assert torch.allclose(torch.ones_like(sx), torch.ones_like(dx))
 
 
+def test_to():
+    shape = (3, 3)
+    dx = torch.full(shape, 2.0, requires_grad=True, dtype=torch.float32)
+    sparsifier = sten.ScalarFractionSparsifier(0.5)
+    sx = SparseTensorWrapper.wrapped_from_dense(
+        sten.MaskedSparseTensor(
+            sten.scalar_mask_sparsify(dx, sparsifier.fraction),
+            sparsifier,
+        ),
+        dx,
+        None,
+    )
+
+    assert sx.device == torch.device("cpu")
+    assert sx.dtype == torch.float32
+    assert sx.wrapped_tensor.data.device == torch.device("cpu")
+    assert sx.wrapped_tensor.data.dtype == torch.float32
+
+    # Signature:
+    # tensor.to(dtype, non_blocking=False, copy=False, memory_format=torch.preserve_format)
+    sx64 = sx.to(torch.float64)
+    assert sx64.dtype == torch.float64
+    assert sx64.wrapped_tensor.data.dtype == torch.float64
+
+    if torch.cuda.device_count() == 0:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            pytest.skip("No CUDA-capable device found")
+        else:
+            return
+
+    # Signature:
+    # tensor.to(device=None, dtype=None, non_blocking=False, copy=False, memory_format=torch.preserve_format)
+    sx_cuda = sx.to("cuda")
+    assert sx_cuda.device.type == "cuda"
+    assert sx_cuda.wrapped_tensor.data.device.type == "cuda"
+
+    # Signature:
+    # tensor.to(other, non_blocking=False, copy=False)
+
+    other = torch.full(
+        shape, 2.0, requires_grad=True, device=torch.device("cuda"), dtype=torch.float64
+    )
+    sx_other = sx.to(other)
+
+    assert sx_other.dtype == torch.float64
+    assert sx_other.wrapped_tensor.data.dtype == torch.float64
+    assert sx_other.device.type == "cuda"
+    assert sx_other.wrapped_tensor.data.device.type == "cuda"
+
+    # check correctess of copy semantics
+    sx_same = sx.to(dx)
+    assert id(sx) == id(sx_same)
+    sx_copy = sx.to(dx, copy=True)
+    assert id(sx) != id(sx_copy)
+    assert id(sx.wrapped_tensor) != id(sx_copy.wrapped_tensor)
+    assert id(sx.wrapped_tensor.data) != id(sx_copy.wrapped_tensor.data)
+
+
 if __name__ == "__main__":
     test_add()
     test_add_()
@@ -245,3 +305,4 @@ if __name__ == "__main__":
     test_sizes()
     test_scalar_mul()
     test_ones_like()
+    test_to()
