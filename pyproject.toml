@@ -25,6 +25,7 @@ dependencies = [
     "coverage",
     "pytest-cov",
     "pytest-xdist",
+    "py-cpuinfo",
 ]
 
 [project.urls]
