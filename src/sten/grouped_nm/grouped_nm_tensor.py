@@ -2,7 +2,7 @@ import torch
 from math import factorial as fact
 import math
 import itertools
-from native_scripting import compile
+from .native_scripting import compile
 import ctypes
 import numpy as np
 import copy
