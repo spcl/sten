@@ -123,13 +123,14 @@ class SparseTensorWrapper(torch.Tensor):
         # We randomly initialize tensor to help finding bugs with the incorrect use of tensor data.
         # We try to keep different shapes, but the same number of elements to avoid memory bugs that
         # may be even harder to catch.
+        dummy_shape = [1]
         if dummy_shape is None:
             dummy_shape = [1] * random.randint(5, 10) + [2, 2, 3]
             random.shuffle(dummy_shape)
         wt = wrapped_tensor_container[0]
         dtype = wt.dtype if hasattr(wt, "dtype") else wt.to_dense().dtype
         device = wt.device if hasattr(wt, "device") else wt.to_dense().device
-        dummy = torch.randint(770, 779, dummy_shape, dtype=dtype, device=device)
+        dummy = torch.randint(77, 79, dummy_shape, dtype=dtype, device=device)
 
         tensor = torch.Tensor._make_subclass(
             cls,
@@ -2412,3 +2413,37 @@ def sparse_torch_nn_functional_linear_bwd_impl(ctx, grad_outputs, input_sparsifi
 # ====================== Backward operator implementations ======================
 
 # ====================== Built-in implementations ======================
+
+
+def time_prof(repeats, func, init=lambda: (), sync=lambda: (), number=1, warmup=0.3, time_budget=0.1, cooldown=0.1):    
+    times = []
+    
+    min_warmup_repeats = int(np.ceil(repeats * warmup))
+    min_total_repeats = min_warmup_repeats + repeats
+        
+    i = 0
+    total_elapsed = 0
+    while True:
+        init()
+        t1 = time.time()
+        for _ in range(number):
+            func()
+        sync()
+        t2 = time.time()
+        # cooldown
+        time.sleep(cooldown)
+        elapsed = (t2 - t1) / number
+        total_elapsed += elapsed
+        times.append(elapsed)
+        i += 1
+        if total_elapsed > time_budget and i >= min_total_repeats:
+            break
+    
+    assert len(times) >= min_total_repeats
+    times = times[int(np.ceil((len(times) - min_warmup_repeats) * warmup)):]
+    assert len(times) >= repeats
+    
+    mean = np.mean(times)
+    std = np.std(times)
+    
+    return mean, std, times
