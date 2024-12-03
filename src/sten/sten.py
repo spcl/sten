@@ -609,7 +609,8 @@ def sparse_fallback(base_impl, func, types, *args, **kwargs):
                 return impl(self.wrapped_tensor, *other_args, **kwargs)
         # fallback
         if inplace:
-            impl = make_sparse_catcher(func, handle_inplace_modifications=True)
+            self_is_sparse = isinstance(self, SparseTensorWrapper)
+            impl = make_sparse_catcher(func, handle_inplace_modifications=self_is_sparse)
             return impl(*args, **kwargs)
         else:
             # functional operator with backprop
@@ -1327,6 +1328,7 @@ PATCHED_OVERRIDES = {
     torch.addmm: lambda input, mat1, mat2, *, beta=1, alpha=1, out=None: -1,
     torch.zeros_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=None: -1,
     torch.ones_like: lambda input, *, dtype=None, layout=None, device=None, requires_grad=False, memory_format=torch.preserve_format: -1,
+    torch.Tensor.conj: lambda input: -1,
 }
 
 
@@ -1853,11 +1855,11 @@ class SparseOp:
 
     def __call__(self, *args, **kwargs):
         sync_cuda()
-        t1 = time.time()
+        # t1 = time.time()
         output = self.run(*args, **kwargs)
         sync_cuda()
-        t2 = time.time()
-        profile_entries.setdefault("SparseOp", []).append(t2 - t1)
+        # t2 = time.time()
+        # profile_entries.setdefault("SparseOp", []).append(t2 - t1)
         return output
 
 
@@ -1925,10 +1927,14 @@ def make_sparse_catcher(orig_fn, handle_inplace_modifications=True):
         all_flat_args = flat_args + flat_kwargs
         if any(isinstance(t, SparseTensorWrapper) for t in all_flat_args):
             # implementation that will handle args properly
-            warnings.warn(
-                f"Catching {torch_name(orig_fn)} called with the sparse arguments!",
-                DispatchWarning,
-            )
+            non_trivial_sparse = any(isinstance(t, SparseTensorWrapper) and not isinstance(t.wrapped_tensor, DenseTensor) for t in all_flat_args)
+            if handle_inplace_modifications and not non_trivial_sparse:
+                warnings.warn("Handling inplace modifications for function that operates only on dense tensors, this may be bad for performance and unnecessary.", DispatchWarning)
+            if non_trivial_sparse:
+                warnings.warn(
+                    f"Catching {torch_name(orig_fn)} called with the sparse arguments!",
+                    DispatchWarning,
+                )
             flat_d_args = densify(flat_args)
             flat_d_kwargs = densify(flat_kwargs)
             all_flat_d_args = flat_d_args + flat_d_kwargs

@@ -19,6 +19,13 @@ class TrainingTensor:
         
     def to_dense(self):
         return self.weight
+    
+    def add_(self, other, alpha=1):
+        self.weight.add_(other, alpha=alpha)
+        
+    @property
+    def shape(self):
+        return self.weight.shape
 
 
 @sten.register_sparsifier_implementation(
@@ -32,6 +39,11 @@ def sparsifier_impl(sparsifier, tensor, grad_fmt=None):
     )
 
 
+@torch.compiler.allow_in_graph
+def sparse_semi_structured_tile_wrapper(tensor):
+    return torch._sparse_semi_structured_tile(tensor, algorithm='', use_cutlass=False)
+
+
 @sten.register_fwd_op_impl(
     operator=torch.nn.functional.linear,
     inp=(torch.Tensor, TrainingTensor, torch.Tensor),  
@@ -41,7 +53,7 @@ def operator_impl(ctx, inputs, output_sparsifiers):
     x, w, bias = inputs
     dense_weight = w.wrapped_tensor.weight
     
-    (packed, meta, packed_t, meta_t, bitmask) = torch._sparse_semi_structured_tile(dense_weight, algorithm='', use_cutlass=False)
+    (packed, meta, packed_t, meta_t, bitmask) = sparse_semi_structured_tile_wrapper(dense_weight)
 
     x_shape = x.shape
     x2d = x.view(-1, x.shape[-1])
@@ -55,9 +67,9 @@ def operator_impl(ctx, inputs, output_sparsifiers):
         packed,
         x_padded.t(),
         bias=bias,
-        transpose_result=False,
+        transpose_result=True,#False,
         alg_id=torch.sparse.semi_structured.SparseSemiStructuredTensor._DEFAULT_ALG_ID,
-    ).t()
+    )#.t()
     result = result_padded[:row, :]
 
     ctx.save_for_backward(x, packed_t)
@@ -87,9 +99,9 @@ def my_operator(ctx, grad_outputs, input_sparsifiers):
         packed_t,
         grad_y2d_padded.t(),
         bias=None,
-        transpose_result=False,
+        transpose_result=True,#False,
         alg_id=torch.sparse.semi_structured.SparseSemiStructuredTensor._DEFAULT_ALG_ID,
-    ).t()
+    )#.t()
     
     grad_x2d = grad_x2d_padded[:row, :]
     grad_x = grad_x2d.view(*grad_y_shape[:-1], -1)
@@ -99,9 +111,9 @@ def my_operator(ctx, grad_outputs, input_sparsifiers):
     return grad_inputs
 
 
-def test_training():
+def run_parametrized(enable_compile, backend):
     assert torch.cuda.is_available()
-    
+
     device = torch.device("cuda")
 
     model = AutoModel.from_pretrained('facebook/dinov2-large').to(device).half()
@@ -111,52 +123,54 @@ def test_training():
     channels = 3
     height = 224
     width = 224
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-    loss_fn = torch.nn.MSELoss()
-
-
-    def train_iteration(model):
+    repeats = 10
+    
+    def train_iteration(model, optimizer):
         inputs = torch.randn((batch, channels, height, width), dtype=torch.half, device=device)
         outputs = model(inputs)
-        target = torch.randn_like(outputs.last_hidden_state)
-        loss = loss_fn(outputs.last_hidden_state, target)
+        loss = outputs.last_hidden_state.mean()
+        loss = loss * loss
         loss.backward()
-
+        
         optimizer.step()
         optimizer.zero_grad()
-
+    
+    assert backend in ['dense', 'torchao', 'sten']
+    if backend == 'dense':
+        pass
+    elif backend == 'torchao':
+        sparse_config = {}
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                sparse_config[name] = SemiSparseLinear
+        swap_linear_with_semi_sparse_linear(model, sparse_config)
+    elif backend == 'sten':
+        sb = sten.SparsityBuilder()
+        for module_name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                weight = module_name + ".weight"
+                sb.set_weight(
+                    name=weight,
+                    initial_sparsifier=TrainingSparsifier(),
+                    out_format=TrainingTensor,
+                )
+        sb.sparsify_model_inplace(model)
         
-    mean, std, times = sten.time_prof(3, lambda: train_iteration(model), sync=torch.cuda.synchronize, warmup=0.3)
-    print(f"Runtime (dense) [ms] mean: {mean * 1e3:.3f}, std: {std * 1e3:.3f}, repeats: {len(times)}")
+    if enable_compile:
+        model = torch.compile(model)
+    
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    mean, std, times = sten.time_prof(repeats, lambda: train_iteration(model, optimizer), sync=torch.cuda.synchronize, warmup=0.3)
+    print(f"Runtime ({backend}, compile={enable_compile}) [ms] mean: {mean * 1e3:.3f}, std: {std * 1e3:.3f}, repeats: {len(times)}")        
 
-    # model_c = torch.compile(model)
-    # mean, std, times = sten.time_prof(3, lambda: train_iteration(model_c), sync=torch.cuda.synchronize, warmup=0.3)
-    # print(f"Runtime (dense, compile) [ms] mean: {mean * 1e3:.3f}, std: {std * 1e3:.3f}, repeats: {len(times)}")
 
-    # sparse_config = {}
-    # for name, module in model.named_modules():
-    #     if isinstance(module, torch.nn.Linear):
-    #         sparse_config[name] = SemiSparseLinear
-    # swap_linear_with_semi_sparse_linear(model, sparse_config)
-    
-    sb = sten.SparsityBuilder()
-    for module_name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear):
-            weight = module_name + ".weight"
-            sb.set_weight(
-                name=weight,
-                initial_sparsifier=TrainingSparsifier(),
-                out_format=TrainingTensor,
-            )
-    sb.sparsify_model_inplace(model)
-    
-    mean, std, times = sten.time_prof(3, lambda: train_iteration(model), sync=torch.cuda.synchronize, warmup=0.3)
-    print(f"Runtime (sparse) [ms] mean: {mean * 1e3:.3f}, std: {std * 1e3:.3f}, repeats: {len(times)}")
-    
-    # model_c = torch.compile(model)
-    # mean, std, times = sten.time_prof(3, lambda: train_iteration(model_c), sync=torch.cuda.synchronize, warmup=0.3)
-    # print(f"Runtime (sparse, compile) [ms] mean: {mean * 1e3:.3f}, std: {std * 1e3:.3f}, repeats: {len(times)}")
+def test_training():
+    run_parametrized(False, 'dense')
+    run_parametrized(False, 'torchao')
+    run_parametrized(False, 'sten')
+    run_parametrized(True, 'dense')
+    run_parametrized(True, 'torchao')
+    run_parametrized(True, 'sten')
 
 
 if __name__ == "__main__":
