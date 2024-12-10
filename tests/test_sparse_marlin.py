@@ -126,7 +126,7 @@ def test_sparse_marlin():
     head_dim = 128
     # random_input = torch.randint(0, 100, (batch, seq_len))
     
-    random_input = torch.randn((batch, seq_len, feature_dim), dtype=torch.float16, device="cuda:0")
+    random_input = torch.randn((batch, seq_len, feature_dim), dtype=dtype, device="cuda:0")
     position_embeddings = (
         torch.randn((batch, seq_len, head_dim), dtype=dtype, device="cuda:0"), 
         torch.randn((batch, seq_len, head_dim), dtype=dtype, device="cuda:0")
