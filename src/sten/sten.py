@@ -12,6 +12,7 @@ from enum import Enum
 import functools
 import textwrap
 import time
+from typing import List, Tuple, Union, Any, Dict, Optional, Sequence
 
 
 # ++++++++++++++++++++++ Core implementation ++++++++++++++++++++++
@@ -332,6 +333,12 @@ def make_new_tensor_with_data_sharing(base_impl, func, types, *args, **kwargs):
     return copy.copy(inp).requires_grad_(False)
 
 
+@implements(torch.Tensor.clone, torch.clone)
+def sparse_tensor_clone(base_impl, func, types, *args, **kwargs):
+    [self] = flattened_tensors(args)
+    return copy.deepcopy(self)
+
+
 @implements(torch.Tensor.data.__set__)
 def sparse_tensor_data_set(base_impl, func, types, *args, **kwargs):
     lhs, rhs = args
@@ -576,6 +583,7 @@ def sparse_fallback_with_backprop(
     return res
 
 
+# @torch.compiler.disable
 def sparse_fallback(base_impl, func, types, *args, **kwargs):
     sem = get_op_semantics(func)
     inplace = is_inplace_op(func)
@@ -1812,6 +1820,7 @@ class SparseOp:
             "grad_out_fmt": self.grad_out_fmt,
         }
 
+    # @torch.compiler.disable
     def run(self, *args, **kwargs):
         pure_args_stubs, flat_args = flatten_list_of_tensors_in_args(args)
         pure_kwargs_stubs, flat_kwargs = flatten_list_of_tensors_in_args(kwargs)
@@ -2439,6 +2448,7 @@ def time_prof(repeats, func, init=lambda: (), sync=lambda: (), number=1, warmup=
         # cooldown
         time.sleep(cooldown)
         elapsed = (t2 - t1) / number
+        print(f"Elapsed: {elapsed}")
         total_elapsed += elapsed
         times.append(elapsed)
         i += 1
