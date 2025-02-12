@@ -81,7 +81,6 @@ class RoSATensor:
         self.S_row_idx = torch.argsort(-1 * torch.diff(self.S_row_offs)).to(torch.int16)
 
     def to_dense(self):
-        import pdb; pdb.set_trace()
         res = self.orig_dense if self.orig_dense is not None else torch.zeros(self.shape, dtype=self.dtype, device=self.device)
         if self.LA is not None:
             res += (self.LB @ self.LA) * self.scaling
@@ -177,10 +176,13 @@ def my_operator(ctx, inputs, output_sparsifiers):
         needs_4bit_deq = True
         W = bnb.functional.dequantize_4bit(orig_W.data, orig_W.quant_state).to(X.dtype)
     
-    if WW.S_val is None:
-        O = torch.mm(X, W.T)
-    else:
-        O = torch.mm(X, csr_add(WW.S_val, WW.S_row_offs, WW.S_row_idx, WW.S_col_idx, W).T)
+    SW = csr_add(WW.S_val, WW.S_row_offs, WW.S_row_idx, WW.S_col_idx, W) if WW.S_val is not None else W
+    O = torch.mm(X, SW.T)
+    
+    # if WW.S_val is None:
+    #     O = torch.mm(X, W.T)
+    # else:
+    #     O = torch.mm(X, csr_add(WW.S_val, WW.S_row_offs, WW.S_row_idx, WW.S_col_idx, W).T)
 
     if b is not None:
         O += b.to(X.dtype).unsqueeze(0)
@@ -193,11 +195,13 @@ def my_operator(ctx, inputs, output_sparsifiers):
         if WW.training:
             keep_prob = 1 - WW.lora_dropout
             D = torch.rand_like(X) < keep_prob
-            O += WW.lora_dropout * torch.mm(torch.mm((X * D) / keep_prob, LA.T), LB.T)
+            XA = torch.mm((X * D), LA.T)
+            O += WW.lora_dropout / keep_prob * torch.mm(XA, LB.T)
         else:
-            O += WW.lora_dropout * torch.mm(torch.mm(X, LA.T), LB.T)
+            XA = torch.mm(X, LA.T)
+            O += WW.lora_dropout * torch.mm(XA, LB.T)
 
-    ctx.save_for_backward(X, orig_W, WW.LA, WW.LB, WW.S_val, WW.S_row_offs, WW.S_row_idx, WW.S_col_idx, D)
+    ctx.save_for_backward(X, orig_W, WW.LA, WW.LB, WW.S_val, WW.S_row_offs, WW.S_row_idx, WW.S_col_idx, D, SW, XA)
     ctx.needs_4bit_deq = needs_4bit_deq
     ctx.input_shape = input_shape
     ctx.lora_scaling = WW.scaling
@@ -219,7 +223,7 @@ def my_operator(ctx, grad_outputs, input_sparsifiers):
     [dO] = grad_outputs
     
     dO = dO.reshape(-1, dO.shape[-1])
-    X, orig_W, LA, LB, S_val, S_row_offs, S_row_idx, S_col_idx, D = ctx.saved_tensors
+    X, orig_W, LA, LB, S_val, S_row_offs, S_row_idx, S_col_idx, D, SW, XA = ctx.saved_tensors
 
     if ctx.needs_4bit_deq:
         W = bnb.functional.dequantize_4bit(orig_W.data, orig_W.quant_state).to(X.dtype)
@@ -238,18 +242,20 @@ def my_operator(ctx, grad_outputs, input_sparsifiers):
         dX = torch.mm(dO, W)
     else:
         dS_val = sddmm(S_row_offs, S_row_idx, S_col_idx, dO.T.contiguous(), X.T.contiguous())
-        dX = torch.mm(dO, csr_add(S_val, S_row_offs, S_row_idx, S_col_idx, W))
+        # dX = torch.mm(dO, csr_add(S_val, S_row_offs, S_row_idx, S_col_idx, W))
+        dX = torch.mm(dO, SW)
 
     if LA is not None:
+        dYB = torch.mm(dO, LB)
         if D is None:
-            dLA = ctx.lora_scaling * torch.mm(torch.mm(LB.T, dO.T), X)
-            dLB = ctx.lora_scaling * torch.mm(dO.T, torch.mm(X, LA.T))
-            dX += ctx.lora_scaling * torch.mm(torch.mm(dO, LB), LA)
+            dLA = ctx.lora_scaling * torch.mm(dYB.T, X)
+            dLB = ctx.lora_scaling * torch.mm(dO.T, XA)
+            dX += ctx.lora_scaling * torch.mm(dYB, LA)
         else:
             XD = X * D
-            dLA = ctx.lora_scaling * torch.mm(torch.mm(LB.T, dO.T), XD) / ctx.keep_prob
-            dLB = ctx.lora_scaling * torch.mm(dO.T, torch.mm(XD, LA.T)) / ctx.keep_prob
-            dX += ctx.lora_scaling * torch.mm(torch.mm(dO, LB), LA) * D / ctx.keep_prob
+            dLA = ctx.lora_scaling * torch.mm(dYB.T, XD) / ctx.keep_prob
+            dLB = ctx.lora_scaling * torch.mm(dO.T, XA) / ctx.keep_prob
+            dX += ctx.lora_scaling * torch.mm(dYB, LA) * D / ctx.keep_prob
     else:
         dLA = None
         dLB = None
